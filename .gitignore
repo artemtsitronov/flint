@@ -1,0 +1,5 @@
+flint
+flint-debug
+flint-stress
+*.o
+*.d
