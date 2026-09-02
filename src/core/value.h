@@ -1,0 +1,136 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Value representation: NaN-boxing.
+ *
+ * A value is one uint64_t. If the top 13 bits are not all set, the word is
+ * an IEEE 754 double. If they are, the next 3 bits are a tag and the low 48
+ * are a payload. That gives numbers, nil, both booleans and a heap pointer
+ * in 8 bytes with no branch on allocation.
+ */
+#ifndef FL_VALUE_H
+#define FL_VALUE_H
+
+// clang-format off: the tagged-union bits below are a bitfield diagram, and a
+// table of masks is only readable as a table. Wrapping any of these lines
+// destroys the column, and nothing here is long enough to need wrapping.
+
+#include <assert.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef uint64_t Value;
+
+/* the 13 high bits. all set means "boxed". */
+#define FL_BOX_MASK     UINT64_C(0xFFF8000000000000)
+#define FL_TAG_SHIFT    48
+#define FL_TAG_MASK     UINT64_C(0x0007000000000000)
+#define FL_PAYLOAD_MASK UINT64_C(0x0000FFFFFFFFFFFF)
+
+#define FL_TAG_NIL   UINT64_C(1)
+#define FL_TAG_FALSE UINT64_C(2)
+#define FL_TAG_TRUE  UINT64_C(3)
+#define FL_TAG_OBJ   UINT64_C(4)
+
+/* one expression, not a function, so it stays usable in a static initializer */
+#define FL_MAKE_BOXED(tag, payload)                                        \
+	(FL_BOX_MASK | ((tag) << FL_TAG_SHIFT) |                           \
+	 ((uint64_t)(payload) & FL_PAYLOAD_MASK))
+
+#define NIL_VAL   ((Value)FL_MAKE_BOXED(FL_TAG_NIL, 0))
+#define FALSE_VAL ((Value)FL_MAKE_BOXED(FL_TAG_FALSE, 0))
+#define TRUE_VAL  ((Value)FL_MAKE_BOXED(FL_TAG_TRUE, 0))
+
+/*
+ * A NaN with a zero payload and the sign bit clear. Every NaN produced by
+ * arithmetic is rewritten to this so it cannot be confused with a box.
+ */
+#define FL_CANONICAL_NAN UINT64_C(0x7FF8000000000000)
+
+static inline bool fl_is_boxed(Value v)
+{
+	return (v & FL_BOX_MASK) == FL_BOX_MASK;
+}
+
+static inline uint64_t fl_tag_of(Value v)
+{
+	return (v & FL_TAG_MASK) >> FL_TAG_SHIFT;
+}
+
+/*
+ * The predicate table. One line each, unaligned, because this is the one
+ * place in the codebase where a column of aligned braces would be worse
+ * than a column of facts: these are seven answers to "what is this value",
+ * and the reader is comparing them, not reading them in order.
+ */
+static inline bool IS_NUMBER(Value v) { return !fl_is_boxed(v); }
+static inline bool IS_NIL(Value v) { return v == NIL_VAL; }
+static inline bool IS_FALSE(Value v) { return v == FALSE_VAL; }
+static inline bool IS_TRUE(Value v) { return v == TRUE_VAL; }
+static inline bool IS_BOOL(Value v) { return IS_TRUE(v) || IS_FALSE(v); }
+static inline bool IS_OBJ(Value v)
+{
+	return fl_is_boxed(v) && fl_tag_of(v) == FL_TAG_OBJ;
+}
+
+/* only nil and false. zero, "" and [] are all true. */
+static inline bool IS_FALSY(Value v) { return v == NIL_VAL || v == FALSE_VAL; }
+
+static inline bool AS_BOOL(Value v) { return v == TRUE_VAL; }
+
+static inline Value BOOL_VAL(bool b) { return b ? TRUE_VAL : FALSE_VAL; }
+
+/* memcpy, not a cast: the compiler may assume a uint64_t is not a double. */
+static inline double AS_NUMBER(Value v)
+{
+	double d;
+	memcpy(&d, &v, sizeof d);
+	return d;
+}
+
+/*
+ * A NaN may carry a payload, and IEEE 754 declines to say whether the
+ * hardware preserves it. In practice it does. We do not rely on it. Every
+ * NaN becomes the canonical one, which costs one compare and removes a
+ * whole class of "why did this number become a string" bug.
+ */
+static inline Value NUMBER_VAL(double d)
+{
+	if (d != d)
+		return (Value)FL_CANONICAL_NAN;
+	Value v;
+	memcpy(&v, &d, sizeof v);
+	return v;
+}
+
+/*
+ * 48 bits of address space is what x86-64 and arm64 give us. If a vendor
+ * ships something wider this assert fires instead of silently corrupting
+ * pointers.
+ */
+static inline Value OBJ_VAL(void *p)
+{
+	uintptr_t u = (uintptr_t)p;
+	assert((u & ~(uintptr_t)FL_PAYLOAD_MASK) == 0);
+	return (Value)FL_MAKE_BOXED(FL_TAG_OBJ, u);
+}
+
+static inline void *AS_OBJ_PTR(Value v)
+{
+	return (void *)(uintptr_t)(v & FL_PAYLOAD_MASK);
+}
+
+/*
+ * Numbers compare by value, everything else by bit pattern. Because strings
+ * are interned, two equal strings are the same pointer, and because boxes
+ * are canonical, no two distinct values share a bit pattern.
+ */
+static inline bool values_equal(Value a, Value b)
+{
+	if (IS_NUMBER(a) && IS_NUMBER(b))
+		return AS_NUMBER(a) == AS_NUMBER(b);
+	return a == b;
+}
+
+#endif /* FL_VALUE_H */
