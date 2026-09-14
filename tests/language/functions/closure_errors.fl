@@ -1,0 +1,158 @@
+# Closures, upvalues, and what happens to them when things go wrong.
+#
+# The interesting lines are near the bottom. A module that fails at top level
+# used to unwind the whole stack to empty, which detached every closure the
+# importing script was holding. The counters below caught it: they kept
+# reporting the same number forever instead of counting up.
+
+# --- basics: a closure captures by reference ---
+
+fn make_counter() {
+	let n = 0
+	fn inc() {
+		n += 1
+		return n
+	}
+	return inc
+}
+
+let c = make_counter()
+print(c())
+print(c())
+print(c())
+
+# two counters are independent
+let c2 = make_counter()
+print(c2())
+print(c())
+print(c2())
+
+# --- a closure outliving its frame ---
+
+fn make_adder(base) {
+	fn add(x) {
+		return base + x
+	}
+	return add
+}
+
+let add5 = make_adder(5)
+let add10 = make_adder(10)
+print(add5(1))
+print(add10(1))
+print(add5(2))
+
+# --- shared capture: two closures, one variable ---
+
+fn make_pair() {
+	let shared = 0
+	fn bump() {
+		shared += 1
+		return shared
+	}
+	fn read() {
+		return shared
+	}
+	return [bump, read]
+}
+
+let pair = make_pair()
+print(pair[0]())
+print(pair[1]())
+print(pair[0]())
+print(pair[1]())
+
+# --- a loop body capturing its own variable ---
+
+fn make_adders() {
+	let out = []
+	let i = 0
+	while i < 3 {
+		let captured = i
+		fn adder(x) {
+			return captured + x
+		}
+		push(out, adder)
+		i += 1
+	}
+	return out
+}
+
+let adders = make_adders()
+print(adders[0](10))
+print(adders[1](10))
+print(adders[2](10))
+
+# --- a closure created inside a conditional block ---
+
+fn maybe(b) {
+	let result = 0
+	if b {
+		let inner = 42
+		fn get() {
+			return inner
+		}
+		result = get()
+	}
+	return result
+}
+
+print(maybe(true))
+print(maybe(false))
+
+# --- a closure that calls another closure ---
+
+fn compose(f, g) {
+	fn composed(x) {
+		return f(g(x))
+	}
+	return composed
+}
+
+fn double(x) {
+	return x * 2
+}
+
+fn increment(x) {
+	return x + 1
+}
+
+let both = compose(double, increment)
+print(both(5))
+
+# --- closures in the importing script, across a module that fails ---
+
+# mod_closing.fl throws at top level. The import fails, this script keeps
+# going, and every closure below must still track its variable.
+import "tests/language/modules/mod_closing.fl"
+
+fn survivor() {
+	let hits = 0
+	fn hit() {
+		hits += 1
+		return hits
+	}
+	return hit
+}
+
+let s = survivor()
+print(s())
+print(s())
+print(s())
+
+# a second, independent closure, to catch a shared-upvalue bug where closing
+# the first one clobbers the second
+fn other() {
+	let total = 100
+	fn add(n) {
+		total += n
+		return total
+	}
+	return add
+}
+
+let o = other()
+print(o(1))
+print(o(2))
+print(s())
+print(o(3))

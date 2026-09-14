@@ -1,0 +1,6 @@
+print(2 + 3 * 4 == 14)
+print(2 * 3 + 4 == 10)
+print(1 < 2 == true)
+print(!false == true)
+print(not nil == true)
+print(5 > 3 == 2 < 4)

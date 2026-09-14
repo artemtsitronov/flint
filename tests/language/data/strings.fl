@@ -1,0 +1,4 @@
+print("hello " + "world")
+print("repeat" == "repeat")
+print("abc" == "def")
+print("concatenated: " + "foo" + "bar")

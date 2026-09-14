@@ -1,0 +1,6 @@
+# A type name that does not exist. Resolved when the file is compiled, so this
+# is a compile error rather than something that only fails if the line runs.
+#
+# Note the case sensitivity: `Number` is not `number`, and there is no reason
+# for it to be, since there is no type system to be consistent with.
+print(1 as frobnicate)

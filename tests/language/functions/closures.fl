@@ -1,0 +1,13 @@
+fn make_counter() {
+	let count = 0
+	fn inc() {
+		count += 1
+		return count
+	}
+	return inc
+}
+
+let c = make_counter()
+print(c())
+print(c())
+print(c())

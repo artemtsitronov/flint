@@ -1,0 +1,21 @@
+1
+1.5
+-0.25
+true
+false
+nil
+str
+[1, 2]
+[1, 2.5, "x", true, false, nil]
+["a", "b"]
+[[1, 2], [3, 4]]
+[[[1]], [[2]]]
+[<table>]
+[<fn helper>]
+[]
+[7]
+200
+0
+199
+<table>
+table

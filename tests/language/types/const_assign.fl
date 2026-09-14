@@ -1,0 +1,9 @@
+# Writing to a global const. This has to be a runtime error, not a compile
+# error, because the const may have come from a module this file imported.
+#
+# It was silently allowed for the whole life of the language: the compile-time
+# check only covered locals, and a global reaches OP_SET_GLOBAL, which had no
+# way to know the binding was constant.
+const X = 1
+X = 2
+print(X)

@@ -1,0 +1,80 @@
+# Table literals in expression position, and for-loops over literals.
+#
+# A table literal used to stash itself in a hidden local slot between key/value
+# pairs. That only works while the table is the topmost thing on the stack, so
+# a literal passed as a call argument set a field on the *callee* instead:
+# `type({a:1})` reported "Only tables have fields". The compiler now keeps the
+# table on the stack and uses OP_SET_FIELD_TOP.
+#
+# A `for` loop also used to accept only a number, an identifier or a paren as
+# its iterable, so `for x in [1, 2]` was a syntax error while the same list
+# assigned to a variable first worked fine.
+
+# --- a literal as a call argument: the case that was broken ---
+
+print(type({a: 1}))
+
+fn identity(x) {
+    return x
+}
+
+print(identity({k: 9}).k)
+print(identity({}).a)
+
+# an argument that is not the first one, so something else is already on the
+# stack above the literal
+fn second(a, b) {
+    return b
+}
+
+print(second(1, {z: 3}).z)
+
+# several pairs, so the table has to survive more than one round
+fn three(x) {
+    return x.a + x.b + x.c
+}
+
+print(three({a: 1, b: 2, c: 3}))
+
+# a repeated key in one literal overwrites rather than appearing twice
+let dup = {a: 1, b: 2, a: 3}
+print(dup.a)
+print(dup.b)
+
+# --- a literal in statement position, which already worked ---
+
+let t = {a: 1, b: 2}
+print(t.a)
+print(t.b)
+t.c = 3
+print(t.c)
+print(t.missing)
+print(type(t))
+
+# --- for over a list literal ---
+
+for x in [1, 2, 3] {
+    print(x)
+}
+
+for x in [] {
+    print("never")
+}
+
+for x in ["a", "b"] {
+    print(x)
+}
+
+# for over a variable, which worked before and must keep working
+let nums = [4, 5]
+for n in nums {
+    print(n)
+}
+
+# ranges still work
+for n in 1..3 {
+    print(n)
+}
+for n in 0..0 {
+    print("never")
+}

@@ -1,0 +1,13 @@
+let l = [1, 2, 3]
+print(len(l))
+print(l[0])
+print(l[-1])
+push(l, 4)
+print(len(l))
+print(pop(l))
+
+let t = { a: 100, b: 200 }
+print(t.a)
+print(t.b)
+t.a = 999
+print(t.a)

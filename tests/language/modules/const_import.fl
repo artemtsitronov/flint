@@ -1,0 +1,11 @@
+# Writing to a global const from a module, and from a const defined in one.
+#
+# Modules share the globals table, so a const exported by one file is
+# read-only for every file that imports it. This cannot be checked by the
+# compiler at all: the import runs at runtime, and it runs before the line
+# below is ever executed.
+import "tests/language/modules/const_source.fl"
+print(LIMIT)
+print(doubled())
+LIMIT = 99
+print(LIMIT)

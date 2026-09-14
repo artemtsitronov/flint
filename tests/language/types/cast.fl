@@ -1,0 +1,80 @@
+# `as`: a checked type assertion.
+#
+# `x as T` checks that x is a T and passes the value through untouched. It is
+# not a conversion. There is nothing to convert between: flint has one numeric
+# type, and every other type is already distinct in the value itself, so a
+# conversion would have to invent a policy for all 49 pairs and then document
+# the ones it got wrong. `str()` is the conversion. `as` is the assertion.
+#
+# What it buys is a named error at the line you wrote, instead of a nil three
+# functions later or a zero that happens to look plausible.
+
+# --- every type name, and a value that matches it ---
+
+print(1 as number)
+print(1.5 as number)
+print("s" as string)
+print(true as bool)
+print(false as bool)
+print(nil as nil)
+print([1, 2] as list)
+print({a: 1} as table)
+
+# a flint function and a native are both "function", which is what type() says
+fn helper() {
+    return 1
+}
+
+print(helper as function)
+print(len as function)
+
+# a cast closure too, since that is a function as far as a script is
+fn make() {
+    fn inner() {
+        return 1
+    }
+    return inner
+}
+let c = make()
+print(c as function)
+
+# --- the value is unchanged, and still an ordinary value ---
+
+let n = 5 as number
+print(n + 1)
+print(n * 2)
+
+let s = "abc" as string
+print(len(s) + 1)
+
+# a cast result can be used anywhere the value could be
+print((len("abcd") as number) + 1)
+
+# --- it composes with the rest of the grammar ---
+
+# a cast of a call result
+fn greet() {
+    return "hi"
+}
+print(greet() as string)
+
+# a cast of a table field
+let t = {n: 5, s: "x"}
+print(t.n as number)
+print(t.s as string)
+
+# a cast of a list element
+let xs = [1, "two"]
+print(xs[0] as number)
+print(xs[1] as string)
+
+# precedence: `as` binds tighter than the arithmetic operators and looser than
+# unary minus, so `-1 as number` is `-(1 as number)`. both read as -1, and the
+# parenthesised form is here so the intent is not a matter of taste.
+print(-1 as number)
+print(1 + 2 as number)
+print((1 + 2) as number)
+
+# `as` on an expression that is already the right type is legal and does
+# nothing, which makes it safe to add defensively
+print(1 as number as number)

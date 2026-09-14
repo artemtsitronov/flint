@@ -1,0 +1,7 @@
+# `as T` where the value is not a T. A mismatch is a runtime error, because
+# the value being checked can come from anywhere, including a module that was
+# not read until the line ran.
+#
+# The message names both types. That is the entire point of the construct: the
+# alternative is finding out three functions later that something was nil.
+print(1 as string)

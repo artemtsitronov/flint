@@ -1,0 +1,13 @@
+# geometry.fl -- imported by import.fl. Not a test on its own: it has no
+# .expected file, so the runner skips it.
+export fn area(w, h) {
+    return w * h
+}
+
+export const PI = 3
+
+export let shape = "rectangle"
+
+export fn describe() {
+    return shape
+}

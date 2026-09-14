@@ -1,0 +1,7 @@
+let a = 10
+let b = 20
+print(a + b)
+a = 30
+print(a)
+const c = 100
+print(c)

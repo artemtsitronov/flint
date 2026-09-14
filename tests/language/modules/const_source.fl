@@ -1,0 +1,7 @@
+# The const source for const_import.fl. Imported, so it produces no output of
+# its own; the test prints what it imports.
+export const LIMIT = 10
+
+export fn doubled() {
+    return LIMIT * 2
+}

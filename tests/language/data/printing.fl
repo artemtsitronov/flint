@@ -1,0 +1,58 @@
+# Printing values, and the containers that hold them.
+#
+# print() on a list used to segfault: print_object() switches on OBJ_TYPE(),
+# which reads a pointer out of the value, and a list element can be a number.
+# These lines are the regression test. Do not "simplify" the element printing
+# back to a plain recursive call.
+
+# scalars
+print(1)
+print(1.5)
+print(-0.25)
+print(true)
+print(false)
+print(nil)
+print("str")
+
+# a list of numbers. this is the line that used to crash.
+print([1, 2])
+
+# mixed element types, including nil and a boolean
+print([1, 2.5, "x", true, false, nil])
+
+# strings are quoted inside a list, so a list of words and a list of strings
+# are not the same output
+print(["a", "b"])
+
+# nested lists
+print([[1, 2], [3, 4]])
+print([[[1]], [[2]]])
+
+# a list holding a table
+print([{ a: 1 }])
+
+# a list holding a function
+fn helper() {
+    return 1
+}
+print([helper])
+
+# empty and one-element lists
+print([])
+print([7])
+
+# a list that grows well past its initial capacity
+let big = []
+let i = 0
+while i < 200 {
+    push(big, i)
+    i += 1
+}
+print(len(big))
+print(big[0])
+print(big[199])
+
+# tables print as an opaque token, not by dumping their contents
+let t = { a: 1, b: 2 }
+print(t)
+print(type(t))

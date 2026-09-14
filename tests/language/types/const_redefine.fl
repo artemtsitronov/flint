@@ -1,0 +1,9 @@
+# `let` on a name that is already const.
+#
+# Redeclaring an ordinary global is allowed and overwrites, which is why
+# this case needs its own check. Silently overwriting a const would leave the
+# entry's flag set, so the "new" binding would be unwritable too: the source
+# would say one thing and the language would do another.
+const Z = 1
+let Z = 2
+print(Z)

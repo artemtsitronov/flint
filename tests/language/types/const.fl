@@ -1,0 +1,67 @@
+# const, in the cases that are allowed to run.
+#
+# Global const used to be decoration: `const x = 1; x = 2` compiled and ran.
+# The flag now lives on the table entry so the VM can see it. The cases that
+# must fail live in the const_*.fl files next to this one, because a script
+# that errors stops there, so each one gets its own file.
+#
+# What is here: reading consts, doing arithmetic with them, letting them
+# survive a table rehash, and confirming ordinary `let` is untouched.
+
+# --- read a global const, and use it in an expression ---
+
+const K = 42
+print(K)
+
+const A = 3
+const B = 4
+print(A * B + A)
+
+# --- const survives a globals-table rehash ---
+#
+# the table grows and rehashes as the script defines more names. proving the
+# flag survives needs a write to fail, so that half lives in const_rehash.fl.
+
+const FIRST = "a"
+let n1 = 1
+let n2 = 2
+let n3 = 3
+let n4 = 4
+let n5 = 5
+let n6 = 6
+let n7 = 7
+let n8 = 8
+let n9 = 9
+let n10 = 10
+let n11 = 11
+let n12 = 12
+let n13 = 13
+let n14 = 14
+let n15 = 15
+
+print(FIRST)
+
+# --- ordinary let is unaffected ---
+
+let mutable = 1
+mutable = 2
+print(mutable)
+
+# redeclaring an ordinary global is still allowed
+let mutable = 99
+print(mutable)
+
+# --- a local const, read ---
+
+fn local_const() {
+    const c = 7
+    return c
+}
+
+print(local_const())
+
+# --- consts are ordinary values in collections ---
+
+const TEN = 10
+let list = [TEN, TEN]
+print(list[0] + list[1])

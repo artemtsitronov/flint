@@ -1,0 +1,15 @@
+# helper for import.fl. imported, so it produces no output of its own when
+# imported; the test prints its functions.
+export fn square(x) {
+	return x * x
+}
+
+export const LIMIT = 100
+
+export let counter = 0
+
+# an exported function that itself calls another exported one, so the import
+# has to keep working after the module's own frame has come and gone
+export fn hypotenuse_sq(a, b) {
+	return square(a) + square(b)
+}

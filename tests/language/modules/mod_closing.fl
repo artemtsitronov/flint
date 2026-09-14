@@ -1,0 +1,16 @@
+# A module that fails at top level, imported by
+# tests/language/functions/closure_errors.fl.
+#
+# The point is not this file's own failure. The point is that the importing
+# script keeps running afterwards, with its frames, its stack slots and its
+# captured variables all intact. A failure inside a module used to unwind the
+# whole stack, which detached every closure the importer was holding -- they
+# kept reporting the same stale number forever.
+#
+# Imported, so it produces no output of its own when imported; the test
+# prints what survives.
+
+let values = [1, 2, 3]
+
+# out of bounds at top level, which is a runtime error during import
+print(values[10])

@@ -1,0 +1,1 @@
+[line 6] Error at 'frobnicate': Unknown type name after 'as'. Expected one of: number, string, bool, nil, list, table, function.

@@ -1,0 +1,25 @@
+let x = 10
+if x > 5 {
+	print(1)
+} else {
+	print(0)
+}
+
+let count = 0
+while count < 3 {
+	count += 1
+}
+print(count)
+
+let sum = 0
+for i in 1..4 {
+	sum += i
+}
+print(sum)
+
+let arr = [10, 20, 30]
+let total = 0
+for v in arr {
+	total += v
+}
+print(total)

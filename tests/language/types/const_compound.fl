@@ -1,0 +1,8 @@
+# Writing to a global const through a compound assignment.
+#
+# `+=` is not a special case: the compiler turns it into a get, an add and a
+# store, and it is the store that has to be refused. If this ever passes, the
+# check is being bypassed for the compound operators.
+const Y = 1
+Y += 1
+print(Y)

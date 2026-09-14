@@ -1,0 +1,13 @@
+# Writing to a global const from inside a function.
+#
+# The point is that the check cannot live in the compiler. A function body is
+# compiled once, and by the time it runs the const may have been defined by a
+# different file entirely. Only the table holding the binding knows.
+const COUNTER = 0
+
+fn bump() {
+    COUNTER = COUNTER + 1
+}
+
+bump()
+print(COUNTER)
