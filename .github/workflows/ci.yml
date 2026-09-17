@@ -1,0 +1,51 @@
+# builds and tests every push and pull request, on gcc and clang.
+# the sanitizers are the point. a build that only passes -O2 is not verified.
+name: ci
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: set compiler
+      run: |
+        echo "CC=${{ matrix.compiler }}" >> $GITHUB_ENV
+
+    # flint compiles in a fraction of a second, so ccache buys almost nothing
+    # here. kept because the matrix runs the same build several times over.
+    - name: configure ccache
+      run: |
+        sudo apt-get update && sudo apt-get install -y ccache
+        ccache --max-size=50M
+        ccache -z
+
+    - name: release build
+      run: make clean && make release
+
+    - name: language tests
+      run: make test
+
+    - name: unit tests
+      run: make test_m1
+
+    - name: debug build and disassembler
+      run: make clean && make debug
+
+    # gc on every allocation plus asan and ubsan. slow, catches everything.
+    - name: gc stress and sanitizers
+      run: make clean && make stress
+
+    - name: ccache stats
+      run: ccache -s

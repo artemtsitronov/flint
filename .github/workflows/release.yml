@@ -1,0 +1,42 @@
+# tags a v* push. builds the release binary, runs the tests, publishes a
+# tarball. no release goes out with a failing test suite.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: configure ccache
+      run: |
+        sudo apt-get update && sudo apt-get install -y ccache
+        ccache --max-size=50M
+        ccache -z
+
+    - name: release build
+      run: make clean && make release
+
+    - name: tests
+      run: make test
+
+    - name: package
+      run: |
+        tar -czvf flint-${{ github.ref_name }}-linux-x86_64.tar.gz flint README.md LICENSE
+
+    - name: publish
+      uses: softprops/action-gh-release@v2
+      with:
+        files: flint-${{ github.ref_name }}-linux-x86_64.tar.gz
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
