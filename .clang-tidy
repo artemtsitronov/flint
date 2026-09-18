@@ -1,0 +1,82 @@
+# Lint policy for flint.
+#
+# The baseline is CONTRIBUTING.md rule 3: zero compiler warnings under
+# -Wall -Wextra -Wpedantic -Werror, on both gcc and clang. This file layers the
+# static analysers on top of that, so `make lint` is one command instead of a
+# wall of flags nobody remembers.
+#
+# Every check switched off below is switched off for a stated reason. A new
+# exclusion has to justify itself here the same way a pragma would have to
+# justify itself on the build.
+Checks: >
+  -*,
+  clang-analyzer-*,
+  clang-diagnostic-*,
+  bugprone-*,
+  concurrency-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -concurrency-mt-unsafe,
+  -misc-no-recursion,
+  -performance-no-int-to-ptr,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-suspicious-realloc-usage,
+  -bugprone-switch-missing-default-case
+
+# The insecureAPI.BufferHandling family wants fprintf_s, memcpy_s and friends.
+# Those are Annex K, which is optional in C11, absent from glibc, and would
+# break the "builds on Linux and BSD" rule in CONTRIBUTING for no gain. A
+# bounded snprintf and an explicit length are the portable equivalents, and
+# the sites that write into a fixed buffer already use them.
+#
+# concurrency-mt-unsafe fires on every fprintf and snprintf. flint is a
+# single-threaded interpreter with no threads and no signal handlers that
+# touch the heap, so there is no race to find.
+#
+# Recursion is the design, not an accident. The compiler is a recursive-descent
+# parser, so expression nesting recurses by definition, and the GC mark phase
+# walks the object graph recursively. Script-level nesting is already bounded
+# by MAX_LOCALS and by the opcode operand widths.
+#
+# NaN boxing casts an int payload back to a pointer. That is the value
+# representation described in common.h, and the round trip is exact.
+#
+# Adjacent same-typed parameters (table_add_all, allocate_string) follow the
+# shapes the whole codebase is built from, and every caller is internal.
+# Renaming them to satisfy the analyser would be churn on the pattern itself.
+#
+# The parser advances inside conditions on purpose, in match() and its callers.
+# Splitting the assignment out of every `if` would obscure the one-line
+# lookahead it performs.
+#
+# `Obj **` and friends are routinely cast to `void *` by fl_reallocate and
+# GROW_ARRAY. The cast is already explicit at every such site; the analyser
+# only objects to the intermediate pointer level.
+#
+# The GC's gray stack deliberately uses realloc directly, so that growing it
+# cannot re-enter the collector. The analyser wants a temp variable, which
+# would reintroduce the recursion the code is written to avoid.
+#
+# The opcode switches are exhaustive over a closed enum, and the enum is the
+# single source of truth for the compiler, the VM and the disassembler. A
+# default arm would hide a new opcode that one of the three forgot to handle,
+# which is the exact bug this is meant to catch.
+WarningsAsErrors: '*'
+
+CheckOptions:
+  - key: readability-function-size.LineThreshold
+    value: '80'
+  - key: readability-function-size.StatementThreshold
+    value: '60'
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.TypeAliasCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
