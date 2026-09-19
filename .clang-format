@@ -1,0 +1,127 @@
+# Formatting policy for flint.
+#
+# The code is hand-formatted, not machine-generated, and it is formatted the
+# kernel way: tabs for indent, 8 columns, ~80 columns of text. clang-format is
+# the tool that enforces it, not the tool that decided the style. Everything
+# below is a deliberate choice about this codebase rather than a default.
+#
+# Run `make fmt` to apply. Run `make fmt-check` to see what would change
+# without touching anything, which is what CI wants.
+
+# LLVM base, so the option names are the ones you already know.
+BasedOnStyle: LLVM
+
+# The kernel indents with tabs. Not configurable in clang-format's favour, and
+# this codebase is full of nested switch and if blocks where spaces drift.
+UseTab: ForIndentation
+TabWidth: 8
+IndentWidth: 8
+
+# Tabs for indentation, spaces for alignment. A struct initializer aligned
+# with tabs at width 8 lands in the wrong column the moment a name gets long,
+# and the diff noise is worse than the misalignment.
+SpacesBeforeTrailingComments: 1
+
+# Case labels sit at the same column as the switch, and their bodies are not
+# indented. This is the one place clang-format's default (IndentCaseBlocks)
+# is actively wrong for kernel style: indenting case bodies makes the
+# dispatch loop in vm.c three levels deep for no gain, and the extra level
+# pushes real code past 80 columns.
+IndentCaseLabels: false
+IndentCaseBlocks: false
+IndentGotoLabels: false
+IndentPPDirectives: AfterHash
+
+# Continuation lines indent by one full tab, like everything else. clang-format
+# defaults to 4 spaces here, which is neither tabs nor the 8 columns the rest
+# of the file uses.
+ContinuationIndentWidth: 8
+
+# Keep the aligned macro blocks in value.h and chunk.h aligned. The tags in a
+# boxed-value header only make sense as a column, and un-aligning them is the
+# fastest way to make that header unreadable.
+AlignConsecutiveMacros: Consecutive
+
+# The 80 column limit is the point of the style. Exceeding it is what makes a
+# kernel patch reviewable, because the reviewer is reading a diff and not
+# scrolling.
+ColumnLimit: 80
+
+# Braces on the same line, and always, even for a body of one line. A brace
+# that jumps to its own line doubles the height of every nested block in the
+# dispatch loop for no gain.
+BreakBeforeBraces: Linux
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: Never
+
+# Short functions may stay on one line.
+#
+# This is the exception to the rule above, and it exists for one place: the
+# type predicates in value.h. IS_NIL, IS_BOOL and the rest are a lookup table
+# of one-line facts about the value representation, and the aligned block is
+# how anyone reads them. Exploded to four lines each, a seven-row table
+# becomes thirty and you can no longer see that it is a table.
+AllowShortFunctionsOnASingleLine: All
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+
+AccessModifierOffset: -2
+
+# Continuation lines get one indent, not alignment to the open paren.
+#
+# This is the setting that made the config fight the code. clang-format
+# aligns with spaces and indents with tabs, so an aligned continuation mixes
+# the two in one line: it lands on a tab stop the eye cannot follow, and it
+# re-wraps differently as soon as a name in the call changes length. The
+# kernel hangs the arguments on their own tab for exactly this reason.
+AlignAfterOpenBracket: DontAlign
+
+# Operands line up under the operator, which is what makes a wrapped
+# expression readable rather than a staircase.
+AlignOperands: Align
+
+# Do not pack several arguments onto one continuation line. Packing is what
+# produces the "wrap whenever the balance of the arguments changes" churn
+# that makes a formatter unusable in review: adding one argument reflows
+# lines that did not change.
+BinPackArguments: false
+BinPackParameters: false
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments: false
+
+PointerAlignment: Right
+DerivePointerAlignment: false
+
+# Keep one space around the binary operators. `a+b` and `a  +  b` are both
+# worse than `a + b`.
+SpaceBeforeParens: ControlStatements
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceAfterCStyleCast: false
+SpaceBeforeAssignmentOperators: true
+
+# Do not reflow comments. Reformatting a comment that someone wrote carefully
+# around is the single most annoying thing a formatter can do, and this
+# codebase has plenty of prose that must not be mangled.
+ReflowComments: false
+
+# No blank line right after an opening brace. The codebase already keeps
+# these out by hand, and a formatter that adds them back is a formatter you
+# start fighting.
+#
+# KeepEmptyLines is a nested block in clang 19 and later. It replaced the
+# older KeepEmptyLinesAtEOF and KeepEmptyLinesAtTheStartOfBlocks, and writing
+# the old flat booleans is a hard error on any current clang, not a warning.
+KeepEmptyLines:
+  AtEndOfFile:     false
+  AtStartOfBlock:  false
+  AtStartOfFile:   false
+MaxEmptyLinesToKeep: 1
+
+# The include order in this tree is deliberate: a file's own header first,
+# then the headers it needs, alphabetical within that. clang-format's category
+# sorting would reshuffle it, and the ordering in a file that includes eight
+# headers is a reviewable decision, not noise to be normalized.
+SortIncludes: Never
+IncludeBlocks: Preserve
