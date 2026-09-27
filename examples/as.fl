@@ -1,0 +1,107 @@
+# as.fl -- `as`, the type assertion.
+#
+# run it:  ./flint examples/as.fl
+#
+# `x as T` checks that x is a T and passes the value through untouched. it is
+# not a conversion. `str()` is the conversion; `as` is the check.
+#
+# the difference matters, so here it is in one line:
+#
+#     str(42)     converts. 42 becomes "42".
+#     42 as string  asserts. and stops, because 42 is not a string.
+#
+# there is nothing else to convert between. flint has one numeric type and
+# every other type is already distinct in the value itself, so a conversion
+# operator would have to invent a policy for all 49 ordered pairs and then
+# document the ones it got wrong. that is a bad afternoon.
+#
+# what `as` actually buys you is a named error on the line you wrote, instead
+# of a nil three functions later or a number that happens to be zero.
+
+# --- the seven type names ---
+#
+# they are exactly the seven type() returns. one vocabulary, nothing else to
+# remember, and no way to spell a type that does not exist.
+
+print(1 as number)         # 1
+print("s" as string)       # s
+print(true as bool)        # true
+print(nil as nil)          # nil
+print([1, 2] as list)      # [1, 2]
+print({a: 1} as table)     # <table>
+
+# a flint function, a closure and a native are all "function", which is what
+# type() says, and a cast is no more particular than that
+fn helper() { return 1 }
+print(helper as function)  # <fn helper>
+print(len as function)     # <native fn>
+
+# --- the value is unchanged ---
+#
+# this is the important part. `as` is not a no-op on the stack, it is a no-op
+# on the value, and everything downstream works exactly as it would have.
+
+let n = 5 as number
+print(n + 1)               # 6
+print(n * 2)               # 10
+
+let s = "abc" as string
+print(len(s) + 1)          # 4
+print(s[0])                # a
+
+# --- it composes anywhere an expression goes ---
+
+fn greet() { return "hi" }
+print(greet() as string)   # hi
+
+let t = {n: 5, s: "x"}
+print(t.n as number)       # 5
+print(t.s as string)       # x
+
+let xs = [1, "two"]
+print(xs[0] as number)     # 1
+print(xs[1] as string)     # two
+
+print(len("abcd") as number + 1)   # 5. `as` binds tighter than `+`.
+
+# precedence detail worth knowing: `as` binds tighter than arithmetic but
+# looser than unary minus, so this asserts on the 1, not on the -1.
+print(-1 as number)        # -1
+print(1 + 2 as number)     # 3, same as (1 + 2) as number
+print((1 + 2) as number)   # 3
+
+# --- where it is worth using ---
+
+# the case `as` exists for: a function that wants a string and would otherwise
+# fail somewhere less obvious.
+fn label(item) {
+    # without this, item.name on a non-table is "only tables have fields", and
+    # on a table with no name key it is a nil that prints as "nil". with it,
+    # the failure names this line.
+    let name = item.name as string
+    return "<" + name + ">"
+}
+
+print(label({name: "thing"}))    # <thing>
+# print(label({}))               # error: expected type 'string' but got 'nil'
+
+# a type name is resolved when the file compiles, so a typo is a compile error
+# and never costs you a run.
+# print(1 as frobnicate)         # error: unknown type name after 'as'
+# print(1 as Number)             # error. case sensitive, and there is no type
+#                                # system to be consistent with.
+
+# a cast of something already the right type is legal and does nothing, which
+# makes it safe to add defensively without thinking about it
+print(1 as number as number)     # 1
+
+# --- what it is not ---
+
+# it does not convert. this is the same error as above, and it is the point.
+# print(str(42) as string)      # fine: str already made it a string
+# print(42 as string)           # error. 42 is not a string.
+
+# it does not tell the compiler anything. there are no annotations and no
+# inference, so the check runs every time the line runs, and the compiler
+# cannot help you with a call three lines away that wants a number.
+# see docs/limits.md

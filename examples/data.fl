@@ -1,0 +1,199 @@
+# data.fl -- the three containers, and how to build what is missing.
+#
+# run it:  ./flint examples/data.fl
+#
+# flint has a list, a table, and a string. they do not convert into each
+# other, and there is no generic container. the language library is small on
+# purpose, so most of this file is writing the functions you would expect to
+# find built in.
+
+# --- lists ---
+
+# a list is ordered, growable, and heterogeneous. nothing stops a list holding
+# three different types, which is occasionally useful and usually a sign you
+# wanted a table.
+let xs = [10, 20, 30]
+push(xs, 40)
+print(xs)          # [10, 20, 30, 40]
+print(len(xs))     # 4
+print(xs[0])       # 10
+print(xs[-1])      # 40. negative indices count from the end.
+print(pop(xs))     # 40, and the list is shorter now
+print(xs)          # [10, 20, 30]
+
+# out of range is an error in either direction. there is no "returns nil" and
+# no "grows for you".
+# print(xs[99])   # error: out of bounds
+
+# index assignment overwrites in place, and does not grow
+xs[0] = 99
+print(xs)          # [99, 20, 30]
+
+# assignment is an expression, so it has a value
+print(xs[1] = 7)   # 7, and xs[1] is now 7
+
+# for iterates values, not indices. use a while when you need the index.
+for x in xs {
+    print(x)
+}
+
+# --- there is no map, so write one ---
+
+fn map(xs, f) {
+    let out = []
+    let i = 0
+    while i < len(xs) {
+        push(out, f(xs[i]))
+        i += 1
+    }
+    return out
+}
+
+fn filter(xs, pred) {
+    let out = []
+    let i = 0
+    while i < len(xs) {
+        if pred(xs[i]) {
+            push(out, xs[i])
+        }
+        i += 1
+    }
+    return out
+}
+
+fn fold(xs, f, initial) {
+    let acc = initial
+    let i = 0
+    while i < len(xs) {
+        acc = f(acc, xs[i])
+        i += 1
+    }
+    return acc
+}
+
+# these compose, which is the point of taking a function as an argument.
+# a name is resolved when the line runs, so define before calling.
+fn is_even(n) { return n % 2 == 0 }
+fn square(n) { return n * n }
+fn add(a, b) { return a + b }
+
+let nums = [1, 2, 3, 4, 5, 6]
+print(map(nums, square))                      # [1, 4, 9, 16, 25, 36]
+print(filter(nums, is_even))                  # [2, 4, 6]
+print(fold(nums, add, 0))                     # 21
+print(map(filter(nums, is_even), square))     # [4, 16, 36]
+
+# --- copying, because assignment shares the object ---
+
+# a list is a heap object. `b = a` copies the reference, so both names see the
+# same list. there is no copy constructor and no deep copy.
+let a = [1, 2]
+let b = a
+push(b, 3)
+print(a)          # [1, 2, 3]. the same list, seen through two names.
+
+# if you need a real copy, build one. this is shallow, which is what you want
+# for a list of numbers and what you do *not* want for a list of lists.
+fn copy_list(xs) {
+    let out = []
+    let i = 0
+    while i < len(xs) {
+        push(out, xs[i])
+        i += 1
+    }
+    return out
+}
+
+let original = [1, 2]
+let duplicate = copy_list(original)
+push(duplicate, 3)
+print(original)    # [1, 2]. unaffected.
+print(duplicate)   # [1, 2, 3]
+
+# --- tables ---
+
+# a table maps string keys to values. keys are always strings, values are
+# anything, and a key that was never set reads as nil rather than erroring.
+let config = {host: "localhost", port: 8080}
+print(config.host)
+print(config.port)
+
+config.port = 9090
+print(config.port)
+
+print(config.missing)     # nil. not an error. a typo is silent, which is
+                          # the tradeoff for cheap partial records.
+
+# adding a key grows the table; writing an existing key overwrites
+config.timeout = 30
+print(config.timeout)
+
+# no delete, and no iteration: you cannot `for` over a table, and there is no
+# keys(). tables keep insertion order but nothing walks it.
+# for k in config { }    # error: len() must be a string or list
+
+# a table is the right shape for a record
+fn describe(c) {
+    return c.host + ":" + str(c.port)
+}
+print(describe(config))
+
+# --- strings ---
+
+# a string is bytes with a length. there is no character type and no
+# character encoding: utf-8 passes through, and indexing gives you one byte.
+let s = "hello"
+print(len(s))
+print(s[0])
+print(s[-1])
+for c in s { print(c) }
+
+# escapes, and an unknown one keeps the character after the backslash
+print("tab\there")
+print("line\nbreak")
+print("say \"hi\"")
+print("back\\slash")
+print("\q")     # q
+
+# `+` joins two strings. there is no interpolation and no format string, so
+# converting is always explicit.
+print("port is " + str(config.port))
+
+# there is no split, so write one. note there is also no slice syntax, which
+# is why substr copies a byte at a time.
+fn substr(s, from, to) {
+    let out = ""
+    let i = from
+    while i < to {
+        out = out + s[i]
+        i += 1
+    }
+    return out
+}
+
+fn split(s, sep) {
+    let parts = []
+    let start = 0
+    let i = 0
+    while i + len(sep) <= len(s) {
+        if substr(s, i, i + len(sep)) == sep {
+            push(parts, substr(s, start, i))
+            start = i + len(sep)
+        }
+        i += 1
+    }
+    push(parts, substr(s, start, len(s)))
+    return parts
+}
+
+let parts = split("a,b,c", ",")
+print(len(parts))
+print(parts[0])
+print(parts[2])
+
+# --- which one to use ---
+
+# list for an ordered sequence, table for named fields, string for text.
+# they do not convert between each other, and there is no generic container
+# to paper over the difference. if you find yourself writing xs[0] and xs[1]
+# together often enough, you wanted a table.

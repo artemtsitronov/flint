@@ -1,0 +1,176 @@
+# closures.fl -- functions that remember.
+#
+# run it:  ./flint examples/closures.fl
+#
+# this is the main thing a language without classes gives you. a function
+# defined inside another function can read and write the outer function's
+# locals, and it captures them by *reference*. two closures over the same
+# variable see each other's writes, which is the whole point.
+#
+# the practical consequence: you can build an object out of a function. a
+# counter with private state is a function returning a function.
+
+# --- the closure factory ---
+
+# each call builds a fresh `count`. nothing is shared between two counters,
+# because the local belongs to one call of make_counter.
+fn make_counter() {
+    let count = 0
+
+    # no `return` keyword on the inner function's name; it is a value, and
+    # values are what we return.
+    fn bump() {
+        count += 1
+        return count
+    }
+
+    return bump
+}
+
+let a = make_counter()
+let b = make_counter()
+
+# `a` and `b` are the same function, from the same source line, and they do not
+# interfere. that is what "by reference to a distinct local" buys you.
+print(a())    # 1
+print(a())    # 2
+print(b())    # 1. a's two writes did not touch b.
+print(a())    # 3
+print(b())    # 2
+
+# --- a counter with more state ---
+
+# this is a small object. the variables are private, there is no `this`, and
+# the only way in is the returned function.
+fn make_bank(starting_balance) {
+    let balance = starting_balance
+    let log = []
+
+    fn deposit(amount) {
+        balance += amount
+        push(log, "deposit " + str(amount))
+        return balance
+    }
+
+    fn withdraw(amount) {
+        if amount > balance {
+            push(log, "refused " + str(amount))
+            return nil
+        }
+        balance -= amount
+        push(log, "withdraw " + str(amount))
+        return balance
+    }
+
+    fn statement() {
+        return log
+    }
+
+    # a table of closures, so one value carries the whole interface
+    return {deposit: deposit, withdraw: withdraw, statement: statement}
+}
+
+let account = make_bank(100)
+print(account.deposit(50))     # 150
+print(account.withdraw(30))    # 120
+print(account.withdraw(500))   # nil. refused, and logged.
+print(account.deposit(10))     # 130
+print(account.statement())     # the log, in order
+
+# --- a fresh binding per loop iteration ---
+
+# `base` is declared inside the while body, so each pass gets its own. the
+# three closures below capture three different variables, not one shared one.
+fn make_adders() {
+    let adders = []
+    let i = 0
+    while i < 3 {
+        let base = i * 10
+
+        fn adder(x) {
+            return base + x
+        }
+
+        push(adders, adder)
+        i += 1
+    }
+    return adders
+}
+
+let adders = make_adders()
+print(adders[0](1))    # 1.   base was 0
+print(adders[1](1))    # 11.  base was 10
+print(adders[2](1))    # 21.  base was 20
+
+# if the declaration were outside the loop, all three would share one `base`
+# and print the same number. that difference is the whole lesson.
+
+# --- passing a function to a function ---
+
+# functions are values, so they go in parameters, lists and tables like
+# anything else. there is no `map` builtin; writing it is a few lines and it
+# composes with every other function here.
+fn map(xs, f) {
+    let out = []
+    let i = 0
+    while i < len(xs) {
+        push(out, f(xs[i]))
+        i += 1
+    }
+    return out
+}
+
+fn filter(xs, pred) {
+    let out = []
+    let i = 0
+    while i < len(xs) {
+        if pred(xs[i]) {
+            push(out, xs[i])
+        }
+        i += 1
+    }
+    return out
+}
+
+fn reduce(xs, f, initial) {
+    let acc = initial
+    let i = 0
+    while i < len(xs) {
+        acc = f(acc, xs[i])
+        i += 1
+    }
+    return acc
+}
+
+let nums = [1, 2, 3, 4, 5]
+
+fn double(n) {
+    return n * 2
+}
+
+fn is_even(n) {
+    return n % 2 == 0
+}
+
+fn add(a, b) {
+    return a + b
+}
+
+print(map(nums, double))            # [2, 4, 6, 8, 10]
+print(filter(nums, is_even))        # [2, 4]
+print(reduce(nums, add, 0))         # 15
+print(map(filter(nums, is_even), double))    # [4, 8]
+
+# --- recursion, which is the other way to get repetition ---
+
+# tail calls are not optimized, so a recursive helper that runs a million
+# deep will hit the 256 frame limit even though every call is in tail
+# position. write it as a loop when the depth matters.
+fn fact(n) {
+    if n <= 1 {
+        return 1
+    }
+    return n * fact(n - 1)
+}
+
+print(fact(10))

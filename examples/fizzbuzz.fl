@@ -1,0 +1,70 @@
+# fizzbuzz.fl -- the first program everyone writes.
+#
+# run it:  ./flint examples/fizzbuzz.fl
+#
+# the interesting part is not the output. it is the four things this uses that
+# a newcomer has not met yet:
+#
+#   1. a range, `1..n`, which is half-open: the start counts, the end does not
+#   2. `if` / `else if` / `else`, and that `else if` is a chain rather than a
+#      new keyword
+#   3. `%`, which is modulo on numbers and has no string form
+#   4. `str()`, because the one way to put a number into a string is to
+#      convert it first. there is no format string and no interpolation
+
+# build the label for one number, then print it. a function that returns a
+# value is the unit of program structure here; there are no classes.
+fn label(n) {
+    if n % 15 == 0 {
+        return "FizzBuzz"
+    }
+    if n % 3 == 0 {
+        return "Fizz"
+    }
+    if n % 5 == 0 {
+        return "Buzz"
+    }
+    # `str` converts, then `+` joins. there is no other way to do this.
+    return str(n)
+}
+
+# the loop variable is scoped to the loop, so `n` does not exist after it
+for n in 1..16 {
+    print(label(n))
+}
+
+# a quick note on the range, because it catches everyone:
+#
+#   1..5   is  1 2 3 4      five is excluded
+#   1..1   is  nothing
+#   0..0   is  nothing
+#
+# to print one to five, ask for 1..6. this is deliberate: the end is a value
+# you can compute without a special case for the last element.
+print("1..5 printed four lines above")
+
+# a while loop is the same thing without the range, and it is what you reach
+# for when the count is not known in advance
+let n = 1
+while n <= 15 {
+    print(label(n))
+    n += 1
+}
+
+# truthiness, the other thing that catches everyone: only `nil` and `false` are
+# false. zero is true. so `if n` is not "if n is non-zero", and using it to
+# test a count is a bug.
+#
+# note the order: the function is defined before it is called. a flint name is
+# resolved when the line *runs*, not when the file is compiled, so calling a
+# function defined further down the file is a runtime "undefined variable".
+fn zero_is_truthy() {
+    let zero = 0
+    if zero {
+        return true
+    }
+    return false
+}
+
+print("zero is truthy, so this is true: " + str(zero_is_truthy()))
+print("and an explicit test is what you want for a count: " + str(0 != 0))

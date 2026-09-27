@@ -1,0 +1,39 @@
+# shapes.fl -- one module of the examples/modules program.
+#
+# a flint module is a file with `fn` and `let` in it. there is no header, no
+# declaration of what it provides, and no namespace. importing it runs it, and
+# everything it defines at the top level becomes a global.
+#
+# `export` marks what you meant to publish. it is a convention, not a mechanism:
+# nothing is actually private, and main.fl can call `normalise` below. write it
+# so a reader knows which names are the interface.
+
+# area() takes a table, because a table is the record type here. there are no
+# classes, no structs and no user-defined types at all.
+#
+# field access is `shape.w`, and it works on tables only. a list has no
+# fields, and neither does a string.
+export fn area(shape) {
+    if shape.kind == "rect" {
+        return shape.w * shape.h
+    }
+    if shape.kind == "circle" {
+        return 3.14159 * shape.r * shape.r
+    }
+    # an unknown kind gives 0 rather than nil, so the caller always gets a
+    # number. returning nil here would push the check onto every caller.
+    return 0
+}
+
+export fn describe(shape) {
+    return shape.kind + " with area " + str(area(shape))
+}
+
+# a private helper. note `not`, and note that a missing field reads as nil,
+# which is falsy, so `if not shape.wide` handles both "false" and "absent".
+fn normalise(shape) {
+    if not shape.wide {
+        return false
+    }
+    return true
+}
