@@ -4,9 +4,9 @@ name: ci
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ main ]
   pull_request:
-    branches: [ master, main ]
+    branches: [ main ]
 
 jobs:
   build:
@@ -38,7 +38,7 @@ jobs:
       run: make test
 
     - name: unit tests
-      run: make test_m1
+      run: make unit
 
     - name: debug build and disassembler
       run: make clean && make debug
