@@ -16,6 +16,12 @@ jobs:
       matrix:
         compiler: [gcc, clang]
 
+    env:
+      # The clang-tidy major version CI installs. Must be >= 19 for the
+      # KeepEmptyLines block in .clang-format, and must currently exist in
+      # apt.llvm.org for the runner's codename. See the install step.
+      LLVM_MAJOR: '24'
+
     steps:
     - uses: actions/checkout@v4
 
@@ -46,6 +52,91 @@ jobs:
     # gc on every allocation plus asan and ubsan. slow, catches everything.
     - name: gc stress and sanitizers
       run: make clean && make stress
+
+    # The computed-goto interpreter. It is a separate binary and a separate
+    # build script, so nothing else in this workflow exercises it, and a
+    # transformation bug in scripts/to_computed_goto.py shows up as a crash at
+    # run time rather than as a compile error.
+    - name: computed-goto interpreter
+      run: |
+        make flint-goto
+        sh tests/run_tests.sh ./flint-goto
+
+    # clang-tidy, which reports include-hygiene problems the compiler does not.
+    #
+    # The LLVM apt packages are the point. The runner's preinstalled
+    # clang-format/tidy are whatever Ubuntu shipped, and .clang-format uses
+    # KeepEmptyLines as a nested block, which only exists in clang 19+. On the
+    # runner's version clang-tidy aborted before checking a single line, so
+    # this step had never actually run -- it just exited 2 and was marked
+    # continue-on-error.
+    #
+    # Pinning the toolchain is what makes it run. The --depth=1 packages are
+    # from the LLVM apt repo and always current.
+    - name: install llvm
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y wget apt-transport-https gpg
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+          | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+        codename=$(lsb_release -cs)
+        echo "deb [signed-by=/usr/share/keyrings/llvm.gpg]" \
+          "http://apt.llvm.org/${codename}/ llvm-toolchain-${codename} main" \
+          | sudo tee /etc/apt/sources.list.d/llvm.list
+        sudo apt-get update
+        # The major version is pinned rather than left to float.
+        #
+        # Asking for bare `clang-tidy` makes apt resolve to clang-tidy-<N> for
+        # whatever N it judges newest, and the snapshot repo carries one major
+        # per distro release. When that resolution picks a version the repo
+        # does not have, apt fails with "not installable" and the step dies
+        # before linting anything -- the same silent failure as before, only
+        # louder.
+        #
+        # The apt.llvm.org llvm-toolchain repo carries exactly one major
+        # version per distro release, so the only safe pin is one that is
+        # currently published. Verified against the noble package index:
+        # clang-tidy and clang-tidy-24, and nothing else. Pinning to 20 --
+        # which is what this was first written as -- fails the same way the
+        # unpinned version did, with 'clang-tidy-20 is not installable'.
+        #
+        # Bump it when a new major lands, and check the index first.
+        sudo apt-get install -y "clang-tidy-${LLVM_MAJOR}"
+
+    # clang-format runs first, on its own. clang-tidy loads .clang-format for
+    # every file it processes, and an unrecognised key there aborts the whole
+    # run before it checks anything -- silently, with exit 2, which reads
+    # exactly like a clean run. Splitting this into its own step means the
+    # failure is attributable.
+    #
+    # It is expected to fail on older toolchains, which is why it is
+    # continue-on-error. Its job here is to make a mismatch visible, not to
+    # gate the build.
+    - name: clang-format config check
+      run: make fmt-check
+      continue-on-error: true
+
+    - name: clang-tidy
+      run: make lint
+      # Advisory by design: the target says so, and a lint policy change
+      # should not be able to block a push. The annotations it produces are
+      # the report, not a gate.
+      continue-on-error: true
+
+    # A file with no trailing newline is a compile error under clang
+    # (-Wnewline-eof) and accepted by gcc. That asymmetry cost a CI run before
+    # it was noticed, and it is trivially checkable.
+    - name: files end with a newline
+      run: |
+        bad=0
+        for f in $(git ls-files '*.c' '*.h' '*.fl' '*.md' '*.py' '*.sh'); do
+          if [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ]; then
+            echo "no newline at end of file: $f"
+            bad=1
+          fi
+        done
+        exit $bad
 
     - name: ccache stats
       run: ccache -s

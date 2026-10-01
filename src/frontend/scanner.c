@@ -8,9 +8,11 @@
  */
 #include "scanner.h"
 
+#include <stdint.h>
 #include <string.h>
 
 typedef struct {
+	const char *source;
 	const char *start; /* start of the current token */
 	const char *current; /* next byte to look at */
 	int line;
@@ -21,6 +23,7 @@ static Scanner scanner;
 
 void scanner_init(const char *source)
 {
+	scanner.source = source;
 	scanner.start = source;
 	scanner.current = source;
 	scanner.line = 1;
@@ -67,6 +70,7 @@ static Token make_token(TokenType type)
 	token.length = (int)(scanner.current - scanner.start);
 	token.line = scanner.line;
 	token.newline_before = scanner.newline_seen;
+	token.offset = (uint32_t)(scanner.start - scanner.source);
 
 	/* a newline belongs to the token that follows it, not this one */
 	scanner.newline_seen = false;
@@ -85,6 +89,7 @@ static Token error_token(const char *message)
 	token.length = (int)strlen(message);
 	token.line = scanner.line;
 	token.newline_before = scanner.newline_seen;
+	token.offset = (uint32_t)(scanner.start - scanner.source);
 	scanner.newline_seen = false;
 	return token;
 }
@@ -286,7 +291,7 @@ static Token number(void)
 		if (peek() == '+' || peek() == '-')
 			advance();
 		if (!is_digit(peek()))
-			return error_token("Unterminated scientific notation.");
+			return error_token("unterminated scientific notation.");
 		while (is_digit(peek()))
 			advance();
 	}
@@ -308,13 +313,13 @@ static Token string(void)
 		if (peek() == '\\') {
 			advance();
 			if (is_at_end())
-				return error_token("Unterminated string.");
+				return error_token("unterminated string.");
 		}
 		advance();
 	}
 
 	if (is_at_end())
-		return error_token("Unterminated string.");
+		return error_token("unterminated string.");
 
 	advance();
 	return make_token(TOKEN_STRING);
@@ -391,5 +396,5 @@ Token scan_token(void)
 		return string();
 	}
 
-	return error_token("Unexpected character.");
+	return error_token("unexpected character.");
 }

@@ -1,7 +1,7 @@
 # the library
 
-seven built-in functions. that is the entire standard library, and it is
-deliberately that small. anything else is a flint function you write.
+Everything a script can call. The core language and the system functions are
+built in; everything else is a module in `lib/`, imported by name.
 
 ## input
 
@@ -41,6 +41,40 @@ its input.
 
 there is no echo control, no history, no line editing and no signal handling.
 it is a prompt and a read.
+
+## string functions
+
+`split(s, sep)` returns a list of byte strings. An empty separator splits into
+one-byte strings. `join(xs, sep)` joins string elements with the separator.
+`trim(s)` removes surrounding whitespace. `contains(s, part)`,
+`starts_with(s, prefix)`, and `ends_with(s, suffix)` return booleans.
+`replace(s, old, new)` replaces occurrences; `lower(s)` and `upper(s)` change
+ASCII letters. These operate on bytes; UTF-8 characters are not decoded.
+
+```flint
+print(split("a,b", ","))
+print(join(["a", "b"], ","))
+print(trim("  flint  "))
+print(contains("flint", "lin"))
+```
+
+## system functions
+
+`args()` returns arguments after the script path. `env(name)` returns the
+environment value or `nil` when the variable is unset. An empty environment
+value is still a string.
+
+`read_file(path)` reads a whole file into a string. `write_file(path, data)`
+writes a string and returns `true` on success. These are not sandboxed. A path
+is a path on the host, and a script can overwrite a file it can name.
+
+`exec(program, arg...)` searches `PATH`, starts the program directly, waits,
+and returns its exit status as a number. It does not invoke a shell and does
+not capture output; the child inherits the process streams.
+
+`exit()` terminates the process with status zero. `exit(code)` accepts an
+integer status from 0 through 255. It does not return to the calling Flint
+function.
 
 ## len
 
@@ -197,19 +231,221 @@ for wall clock timing, measure outside the interpreter, with `time`.
 not part of the language. the compiler emits a call to it for every `import`
 statement, and you should not call it yourself. see [modules.md](modules.md).
 
-## what is missing
+## missing pieces
 
-deliberately, and each would be a function you write:
+`str([1, 2])` is still `<object>`. `print` knows how to render containers;
+`str()` does not. sorting is not a built-in; use a comparison loop or reach
+for `collections` which has `min` and `max`.
 
-- no `print`-to-a-string, so you cannot build a log line without `+` and `str()`
-- no file io, no environment, no process control
-- no echo control or history on `input`. it prompts and reads, and that is it.
-- no random numbers. there is no seedable PRNG in the runtime, and adding one
-  means picking a source of entropy that is not a portability problem
-- no string methods, so `"a,b".split(",")` is a `while` loop
-- no sorting, on either lists or tables
-- no integer, so there is no integer division or overflow to think about, and
-  no exact arithmetic above 2^53
 
-each of these is a few lines of flint, and keeping them out keeps the runtime
-small enough to read in an afternoon.
+## internal math
+
+ten `__`-prefixed natives exist for a math library that is not in this
+repository yet. they are deliberately not part of the language: a leading
+underscore means "not for you", and nothing in the documentation or the
+examples uses them.
+
+| native | |
+|---|---|
+| `__floor(x)` | largest integer not above x |
+| `__sqrt(x)` | square root |
+| `__fma(a,b,c)` | `a*b+c` with one rounding |
+| `__ldexp(x,n)` | x times 2 to the n |
+| `__logb(x)` | exponent as a number |
+| `__fabs(x)` | absolute value |
+| `__copysign(x,y)` | x with y's sign |
+| `__hi32(x)` / `__lo32(x)` | half of a double's bits |
+| `__from_bits(hi,lo)` | a double rebuilt from two halves |
+
+they take and return numbers, and a non-number argument is a runtime error
+like any other. the wrappers live in `src/util/fl_math.c` so the language and
+the maths stay separate.
+
+contributed in [#1](https://github.com/programmersd21/flint/pull/1).
+
+## math
+
+```flint
+import math
+print(math.sqrt(2))
+```
+
+the first library anyone imports, and the one the rest of the standard
+library leans on. every function takes and returns numbers, because that is
+the only numeric type flint has.
+
+a bare name is a library, not a file. `import "foo.fl"` looks next to the
+importing file, `import math` looks in the standard library, and the module
+loader tells them apart. there is one module system, not two.
+
+| | |
+|---|---|
+| `math.pi` `math.e` `math.tau` | the usual constants |
+| `math.sqrt2` `math.ln2` `math.ln10` | the two-letter ones |
+| `math.abs(x)` | |
+| `math.sqrt(x)` `math.cbrt(x)` `math.exp(x)` `math.exp2(x)` | |
+| `math.log(x)` `math.log2(x)` `math.log10(x)` | |
+| `math.pow(x, y)` | there is no `^`. it is xor elsewhere, and flint does not pretend otherwise |
+| `math.sin` `cos` `tan` `asin` `acos` `atan` | radians. always. |
+| `math.atan2(y, x)` | |
+| `math.sinh` `cosh` `tanh` `asinh` `acosh` `atanh` | |
+| `math.floor` `ceil` `trunc` | |
+| `math.round(x)` | **half away from zero** |
+| `math.fmod` `math.remainder` `math.copysign` | |
+| `math.isnan` `math.isinf` `math.isfinite` | |
+
+### the two that surprise people
+
+`round` is half away from zero, so `round(0.5)` is 1 and `round(-0.5)` is -1.
+the c library's `nearby()` rounds half to even and would give 0 and 0. flint
+does not use it, because "what everyone means by round" is worth more than
+consistency with a function whose name does not mean round.
+
+`cbrt(-27)` is -3. `pow(-27, 1/3)` is `nan`, and that is correct for a
+function that has to be right about negative zero and infinities. it is still
+the wrong tool for a cube root, which is why both exist.
+
+### what is not promised
+
+libm is not bit-identical across platforms, and the last digit of a
+transcendental function may differ. what flint promises is the behaviour at
+the edges: `sqrt(0)` is 0, `cbrt` works on negatives, division by zero gives
+infinity rather than an error, and `0/0` is `nan`, which is not equal to
+itself.
+
+## path
+
+```flint
+import path
+print(path.join("a", "b", "c"))
+```
+
+path manipulation, and nothing else. every function here is string
+arithmetic: this module never touches the disk. that is `fs`, and mixing the
+two is how a `join` ends up doing io when somebody expected a string.
+
+| | |
+|---|---|
+| `path.join(a, b)` | one separator, never two. empty parts are skipped |
+| `path.basename(p)` | after the last separator |
+| `path.dirname(p)` | before the last separator, or `"."` |
+| `path.ext(p)` | with the dot, or `""`. a leading dot is not an extension |
+| `path.stem(p)` | the name without the extension |
+| `path.isabs(p)` | starts at the root |
+| `path.has_ext(p, list)` | case-insensitive, list holds bare extensions |
+| `path.sep` | `"/"` |
+
+`has_ext("a.tar.gz", ["gz"])` matches on the *last* extension, which is what
+`ext` returns. asking for `tar.gz` is a different question and is not the one
+this answers.
+
+the separator is always `/`, including on windows, so a path that arrived in a
+config file behaves the same everywhere. a path written as `a\b` is treated as
+one component. that is a known limitation, not an oversight: a module that
+guesses at the host separator is a module that is wrong in one direction and
+surprising in the other.
+
+## random
+
+```flint
+import random
+print(random.rand())              # a float in [0, 1)
+print(random.rand_int(1, 6))     # an integer in [1, 6]
+random.shuffle(my_list)          # shuffles in place, returns nil
+print(random.choice(my_list))    # picks one element
+```
+
+xorshift64* seeded from the clock and process id at first use. fast and
+adequate for scripts; not cryptographic. the source says so explicitly.
+
+`seed(n)` resets the state to a known value, which makes a run reproducible.
+useful in tests; not an invitation to assume global state across modules.
+
+## time
+
+```flint
+import time
+let t = time.now()           # unix epoch, fractional seconds
+print(time.format(t))        # "2006-01-02T15:04:05Z" (always UTC)
+time.sleep(500)              # milliseconds. blocks.
+print(time.clock_ms())       # monotonic wall clock, milliseconds
+
+let ms = time.measure(fn() {
+    # something you want to time
+})
+print("took " + str(ms) + "ms")
+```
+
+`now()` and `format()` use wall clock time. `clock_ms()` is monotonic and
+suitable for benchmarking. `sleep()` takes milliseconds and calls `nanosleep`
+internally; a sleep of zero is a yield.
+
+## fs
+
+```flint
+import fs
+
+if fs.exists("config.txt") {
+    let content = fs.read("config.txt")
+    print(content)
+}
+
+fs.write("out.txt", "hello\n")
+fs.append("log.txt", "one more line\n")
+fs.mkdir("new_dir")
+print(fs.isdir("new_dir"))   # true
+fs.remove("tmp.txt")
+```
+
+`read` returns the entire file as a string. `write` and `append` return `nil`.
+`exists`, `isdir` return booleans. `mkdir` creates one directory level (not
+recursive). `remove` deletes a file; removing a directory that is not empty is
+an error.
+
+these are thin wrappers over `fopen`/`fread`/`fwrite`/`stat`. no buffering,
+no magic. what posix gives you is what you get.
+
+## collections
+
+```flint
+import collections as c
+
+let xs = [3, 1, 4, 1, 5, 9]
+print(c.min(xs))               # 1
+print(c.max(xs))               # 9
+print(c.sum(xs))               # 23
+print(c.reverse(xs))           # [9, 5, 1, 4, 1, 3]
+print(c.uniq(xs))              # [3, 1, 4, 5, 9]  (order preserved)
+print(c.contains(xs, 4))       # true
+print(c.flatten([[1,2],[3]]))  # [1, 2, 3]
+print(c.zip([1,2], ["a","b"])) # [[1, "a"], [2, "b"]]
+```
+
+`reverse` returns a new list; the original is unchanged. `uniq` preserves
+first occurrence. `zip` stops at the shorter list. `min`, `max`, `sum` require
+a non-empty list and operate on numbers.
+
+## json
+
+```flint
+import json
+
+let obj = json.parse("{\"x\": 1, \"ys\": [2, 3]}")
+print(obj.x)           # 1
+print(obj.ys[0])       # 2
+
+let s = json.stringify(obj)      # {"x":1,"ys":[2,3]}
+let p = json.pretty(obj)         # indented, 2 spaces
+```
+
+`parse` returns a table for objects, a list for arrays, a number for numbers,
+a string for strings, a bool for booleans, and `nil` for null. a JSON error
+is a runtime error naming the offset.
+
+`stringify` and `pretty` accept numbers, strings, booleans, nil, lists, and
+tables with string keys. a function in the value tree is a runtime error,
+because a function is not JSON and pretending it is makes round-trips wrong.
+
+circular references are not detected. the vm will overflow the call stack
+first, which is a fine outcome: a circular structure is a bug, not an edge
+case to handle gracefully.

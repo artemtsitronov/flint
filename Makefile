@@ -30,7 +30,7 @@ CFLAGS ?=
 # string literal. Without them -D hands the preprocessor a bare token and
 # the build fails in a way that looks nothing like a quoting problem.
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-ALL_CFLAGS := $(STD) $(WARN) $(INCLUDES) $(CFLAGS) -DFLINT_VERSION="\"$(VERSION)\""
+ALL_CFLAGS := $(STD) $(WARN) $(INCLUDES) -D_POSIX_C_SOURCE=200809L $(CFLAGS) -DFLINT_VERSION="\"$(VERSION)\""
 
 SRCDIRS := src src/core src/frontend src/runtime src/util
 
@@ -83,7 +83,7 @@ DBG_CFLAGS := -O0 -g3 -DFL_DEBUG_PRINT_CODE -DFL_DEBUG_TRACE_EXECUTION
 STR_CFLAGS := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -DFL_GC_STRESS
 STR_LDFLAGS := -fsanitize=address,undefined
 
-.PHONY: all release debug stress test unit bench lint fmt fmt-check clean help
+.PHONY: all release debug stress test diagnostic-test unit bench check lint fmt fmt-check clean help flint-goto
 .SUFFIXES:
 
 # If a compile fails partway, do not leave a truncated object behind. Make
@@ -137,6 +137,9 @@ $(STR_DIR)/%.o: %.c
 test: flint
 	@sh tests/run_tests.sh ./flint
 
+diagnostic-test: flint
+	@sh tests/diagnostics.sh ./flint
+
 # The build that finds bugs. GC on every allocation means every missing root
 # turns into a use-after-free immediately instead of on a Tuesday, and asan
 # plus ubsan catch the rest. Slow on purpose.
@@ -158,7 +161,7 @@ LIB_OBJS := $(filter-out $(REL_DIR)/src/main.o,$(REL_OBJS))
 #
 # The .bin targets are ordinary files and get rebuilt only when something
 # changed. The test targets are phony and always run what they built.
-.PHONY: test_value test_chunk
+.PHONY: test_value test_chunk test_verify
 
 test_value.bin: $(UNIT_DIR)/unit_value.o
 	$(CC) $(ALL_CFLAGS) $(REL_CFLAGS) $^ -o $@ $(LIBS)
@@ -166,11 +169,17 @@ test_value.bin: $(UNIT_DIR)/unit_value.o
 test_chunk.bin: $(UNIT_DIR)/test_chunk.o $(LIB_OBJS)
 	$(CC) $(ALL_CFLAGS) $(REL_CFLAGS) $^ -o $@ $(LIBS)
 
+test_verify.bin: $(UNIT_DIR)/test_verify.o $(LIB_OBJS)
+	$(CC) $(ALL_CFLAGS) $(REL_CFLAGS) $^ -o $@ $(LIBS)
+
 test_value: test_value.bin
 	@./test_value.bin
 
 test_chunk: test_chunk.bin
 	@./test_chunk.bin
+
+test_verify: test_verify.bin
+	@./test_verify.bin
 
 # Built in the release tree on purpose: these run under the same -Werror
 # baseline as the interpreter, so a header change that breaks them shows up
@@ -181,17 +190,64 @@ $(UNIT_DIR)/%.o: tests/unit/%.c
 
 # Each test reports through its exit status, so make stops at the first
 # failure and names it rather than running the rest onto a broken build.
-unit: test_value test_chunk
+unit: test_value test_chunk test_verify
 
-# benchmarks. run_tests.sh exists; bench/run.sh does not yet, so this target
-# is a placeholder and will tell you so rather than failing with a confusing
-# "no such file" from the shell.
+#
+# The computed-goto interpreter.
+#
+# A switch is portable C11. Computed goto is a GCC/Clang extension that drops
+# the bounds check and lets the processor predict the next opcode from the
+# previous one, and it is worth 7-21% on loop-heavy programs -- measured, see
+# bench/RESULTS.md.
+#
+# It is not the default because taking the address of a label is not standard
+# C, and this project builds with -Wpedantic -Werror and has never needed to
+# relax either for a feature. So the fast interpreter is a separate binary
+# produced by transforming the source, rather than a #ifdef in it:
+#
+#   * one copy of the interpreter, not two that have to be kept in step
+#   * the default build stays portable and warning-clean
+#   * the transformation is a script you can read, rather than a macro that
+#     hides sixty handlers behind one
+#
+# scripts/to_computed_goto.py rewrites the dispatch into labels. It is
+# idempotent and it refuses to run on an already-transformed file.
+GOTO_DIR := $(BUILD)/goto
+GOTO_VM := $(GOTO_DIR)/vm.c
+GOTO_OBJS := $(SRCS:%.c=$(REL_DIR)/%.o)
+GOTO_OBJS := $(filter-out $(REL_DIR)/src/runtime/vm.o,$(GOTO_OBJS)) $(GOTO_DIR)/vm.o
+
+flint-goto: $(GOTO_VM) $(GOTO_OBJS)
+	$(CC) $(ALL_CFLAGS) -std=gnu11 -Wno-pedantic $(REL_CFLAGS) $(GOTO_OBJS) -o $@ $(LIBS)
+
+$(GOTO_VM): src/runtime/vm.c scripts/to_computed_goto.py
+	@mkdir -p $(dir $@)
+	@python3 scripts/to_computed_goto.py --output $@ $<
+
+$(GOTO_DIR)/vm.o: $(GOTO_VM)
+	$(CC) $(ALL_CFLAGS) -std=gnu11 -Wno-pedantic $(REL_CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+# Benchmarks.
+#
+# `make bench` measures the portable build, because that is the one everybody
+# has. `make bench-goto` builds the computed-goto interpreter and measures that
+# too, and writes the numbers into RESULTS.md's place -- see bench/compare.sh,
+# which does an old-binary-against-new-binary comparison rather than an absolute
+# timing, because that is the only comparison that survives a busy machine.
 bench: flint
-	@if [ -x bench/run.sh ] || [ -f bench/run.sh ]; then \
-		sh bench/run.sh; \
-	else \
-		echo "bench/run.sh does not exist. nothing to benchmark yet."; \
-	fi
+	@python3 bench/bench.py
+
+bench-goto: flint flint-goto
+	@sh bench/compare.sh ./flint ./flint-goto
+
+# Full gate: clean build then every test suite. The only target that proves the
+# tree is green from scratch. `make test` alone tests a possibly stale binary;
+# this one does not. Use it before pushing or tagging.
+check:
+	$(MAKE) clean
+	$(MAKE) release
+	$(MAKE) test
+	$(MAKE) unit
 
 # Static analysis. Reads .clang-tidy for the check list and the reason each
 # exclusion is there, so the policy lives in one reviewable place.
@@ -202,6 +258,7 @@ bench: flint
 # lint failure on a machine that happens to have a different clang.
 CLANG_TIDY ?= clang-tidy
 TIDY_FLAGS := --quiet --extra-arg=-std=c11 \
+	--extra-arg=-D_POSIX_C_SOURCE=200809L \
 	--extra-arg=-Isrc/core --extra-arg=-Isrc/frontend \
 	--extra-arg=-Isrc/runtime --extra-arg=-Isrc/util
 
@@ -266,8 +323,8 @@ fmt-check:
 	echo "all $(words $(FMT_FILES)) files formatted"
 
 clean:
-	rm -rf $(BUILD) flint flint-debug flint-stress \
-		test_value.bin test_chunk.bin
+	rm -rf $(BUILD) flint flint-debug flint-stress flint-goto \
+		test_value.bin test_chunk.bin test_verify.bin
 
 help:
 	@echo "make            release build          -> ./flint"
@@ -275,8 +332,11 @@ help:
 	@echo "make stress     gc stress + asan/ubsan, runs the suite"
 	@echo "make test       release build, runs the language suite"
 	@echo "make unit       value and chunk unit tests"
+	@echo "make check      clean + build + test + unit (gate quality)"
+	@echo "make flint-goto computed-goto interpreter, 7-21% faster"
+	@echo "make bench      benchmarks (bench/bench.py)"
 	@echo "make lint       clang-tidy, policy in .clang-tidy"
 	@echo "make clean      remove build/ and the binaries"
 	@echo ""
 	@echo "add CFLAGS=... to override flags, CC=clang to change compiler."
-	@echo "every target works with -j. nothing is order-dependent."
+	@echo "every target works with -j. check does not (intentionally sequential)."

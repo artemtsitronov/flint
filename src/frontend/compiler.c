@@ -14,6 +14,7 @@
 #include "compiler.h"
 #include "chunk.h"
 #include "common.h"
+#include "diagnostic.h"
 #include "memory.h"
 #include "object.h"
 #include "scanner.h"
@@ -77,6 +78,14 @@ typedef struct {
 	int depth;
 	bool is_captured;
 	bool is_const;
+	/*
+	 * Where the name was written, so a redeclaration in the same scope can
+	 * point back at the first one. A copy rather than a pointer, because
+	 * the token is a window into the source buffer and a pointer to it
+	 * would dangle once the buffer went away. Four bytes, and the only
+	 * thing that makes a duplicate-definition error show both halves.
+	 */
+	uint32_t name_offset;
 } Local;
 
 /* how to get one upvalue: from a local slot, or from our own upvalue. */
@@ -118,10 +127,17 @@ typedef struct LoopContext {
 	int continue_count;
 } LoopContext;
 
+/* how many diagnostics before we stop and summarise instead. a file with
+ * three mistakes should say so three times; a file that is wrong from the
+ * first byte can produce thousands, and thousands is not information */
+#define MAX_DIAGNOSTICS 20
+
 typedef struct {
 	Token current;
 	Token previous;
 	bool had_error;
+	int error_count;
+	bool suppressed; /* past MAX_DIAGNOSTICS: stop reporting */
 	/* after one error, stop reporting until the parser resynchronizes */
 	bool panic_mode;
 } Parser;
@@ -147,9 +163,63 @@ typedef struct {
 	Compiler *current; /* innermost function being compiled */
 	VM *vm; /* for allocation, and the GC's view */
 	LoopContext *loop; /* innermost loop, for break and continue */
+
+	/* repl echo: leave an expression statement's value on the stack
+	 * rather than popping it, so `1 + 2` can answer. see
+	 * expression_statement() */
+	bool echo_repl_value;
+	bool left_value_on_stack;
 } CompilerState;
 
 static CompilerState state;
+static const FlSource *diag_source;
+static FlDiagFormat diag_format = FL_DIAG_LEGACY;
+static FlColorMode diag_color = FL_COLOR_AUTO;
+static const char *diag_text;
+static const char *diag_name;
+static FlDiagSuggestion fixes[64];
+static size_t fix_count;
+
+size_t compiler_fix_count(void) { return fix_count; }
+
+const FlDiagSuggestion *compiler_fix_at(size_t index)
+{
+	return index < fix_count ? &fixes[index] : NULL;
+}
+
+void compiler_repl_echo(bool on) { state.echo_repl_value = on; }
+
+bool compiler_repl_value(void)
+{
+	bool left = state.left_value_on_stack;
+	state.left_value_on_stack = false;
+	return left;
+}
+
+void compiler_set_diagnostics(
+        const FlSource *source, FlDiagFormat format, FlColorMode color)
+{
+	diag_source = source;
+	diag_format = format;
+	diag_color = color;
+}
+
+static const char *diagnostic_code(const Token *token, const char *message)
+{
+	if (token->type == TOKEN_ERROR) {
+		if (strstr(message, "unexpected character") != NULL)
+			return "E0001";
+		if (strstr(message, "scientific notation") != NULL)
+			return "E0002";
+		if (strstr(message, "string") != NULL)
+			return "E0003";
+	}
+	if (strstr(message, "expect ')'") != NULL ||
+	        strstr(message, "expect '}'") != NULL ||
+	        strstr(message, "expect ']'") != NULL)
+		return "E0102";
+	return "E0100";
+}
 
 static Chunk *current_chunk(void) { return &state.current->function->chunk; }
 
@@ -166,19 +236,158 @@ static void error_at(Token *token, const char *message)
 		return;
 	state.parser.panic_mode = true;
 
-	fprintf(stderr, "[line %d] Error", token->line);
-	if (token->type == TOKEN_EOF)
-		fprintf(stderr, " at end");
-	else if (token->type != TOKEN_ERROR)
-		fprintf(stderr, " at '%.*s'", token->length, token->start);
+	/* past the cap, stop talking. a file that is wrong from the first
+	 * byte can produce thousands of diagnostics and thousands is not
+	 * information, it is a wall. the summary at the end says how
+	 * many were dropped. */
+	if (state.parser.suppressed)
+		return;
+	if (state.parser.error_count >= MAX_DIAGNOSTICS) {
+		state.parser.suppressed = true;
+		fprintf(stderr,
+		        "too many errors; stopping after %d. fix those and "
+		        "run again to see more.\n",
+		        MAX_DIAGNOSTICS);
+		return;
+	}
+	if (diag_format == FL_DIAG_LEGACY) {
+		fprintf(stderr, "[line %d] Error", token->line);
+		if (token->type == TOKEN_EOF)
+			fprintf(stderr, " at end");
+		else if (token->type != TOKEN_ERROR)
+			fprintf(stderr,
+			        " at '%.*s'",
+			        token->length,
+			        token->start);
+		fprintf(stderr, ": %s\n", message);
+		state.parser.had_error = true;
+		state.parser.error_count++;
+		return;
+	}
+	FlDiagSuggestion suggestion;
+	const FlDiagSuggestion *suggestions = NULL;
+	size_t suggestion_count = 0;
 
-	fprintf(stderr, ": %s\n", message);
+	/*
+	 * A missing delimiter is a problem with the token *before* it, not
+	 * with whatever token the parser happened to be holding. The
+	 * insertion point is the end of the previous token, which is where
+	 * the delimiter belongs.
+	 *
+	 * Offering a fix used to be restricted to end of file, on the
+	 * reasoning that a delimiter is missing "at the end". That was
+	 * wrong: the common case is a missing brace in the middle of a
+	 * function, and it got neither the right span nor a fix. This is a
+	 * property of the *message*, not of where the parser ran out of
+	 * input.
+	 */
+	const char *delimiter = NULL;
+	if (strstr(message, "expect ')'") != NULL)
+		delimiter = ")";
+	else if (strstr(message, "expect '}'") != NULL)
+		delimiter = "}";
+	else if (strstr(message, "expect ']'") != NULL)
+		delimiter = "]";
+
+	size_t start = token->offset;
+	size_t len = (size_t)token->length;
+	const char *label =
+	        token->type == TOKEN_EOF ? "expected here" : "unexpected token";
+
+	if (delimiter != NULL) {
+		Token *prev = &state.parser.previous;
+		if (prev->type != TOKEN_EOF) {
+			start = (size_t)prev->offset + (size_t)prev->length;
+			len = 0;
+			label = "expected here";
+		}
+		suggestion = (FlDiagSuggestion){
+		        .span = fl_span(start, start + len),
+		        .message = "add the missing delimiter",
+		        .replacement = delimiter,
+		        .applicability = FL_APPLICABILITY_MACHINE,
+		};
+		suggestions = &suggestion;
+		suggestion_count = 1;
+		if (fix_count < sizeof(fixes) / sizeof(fixes[0]))
+			fixes[fix_count++] = suggestion;
+	}
+	FlDiagnostic diag = {
+	        .severity = FL_DIAG_ERROR,
+	        .code = diagnostic_code(token, message),
+	        .message = message,
+	        .primary = fl_span(start, start + len),
+	        .has_primary = true,
+	        .primary_label = label,
+	        .suggestions = suggestions,
+	        .suggestion_count = suggestion_count,
+	};
+	FlSource source;
+	bool temporary = diag_source == NULL;
+	if (temporary) {
+		fl_source_init(&source, diag_name, diag_text);
+		diag_source = &source;
+	}
+	fl_diag_emit(stderr, &diag, diag_source, diag_format, diag_color);
+	if (temporary) {
+		fl_source_free(&source);
+		diag_source = NULL;
+	}
 	state.parser.had_error = true;
+	state.parser.error_count++;
 }
 
 static void error(const char *message)
 {
 	error_at(&state.parser.previous, message);
+}
+
+/*
+ * An error with one related location attached.
+ *
+ * A redeclaration is the case that needs it: saying "already a variable with
+ * this name" and stopping there leaves the reader to go and find the other
+ * one. With the second span attached the diagnostic can show both halves, and
+ * the eye can go straight between them.
+ *
+ * The extra span is a window into the same source, so it stays valid for
+ * exactly as long as the primary does.
+ */
+static void error_with_label(const char *message,
+        size_t other_start,
+        size_t other_end,
+        const char *label)
+{
+	Token *token = &state.parser.previous;
+	FlDiagLabel extra = {
+	        .span = fl_span(other_start, other_end),
+	        .label = label,
+	};
+	FlDiagnostic diag = {
+	        .severity = FL_DIAG_ERROR,
+	        .code = "E0201",
+	        .message = message,
+	        .primary = fl_span((size_t)token->offset,
+	                (size_t)token->offset + (size_t)token->length),
+	        .has_primary = true,
+	        .primary_label = "defined again here",
+	        .labels = &extra,
+	        .label_count = 1,
+	};
+
+	FlSource source;
+	bool temporary = diag_source == NULL;
+	if (temporary) {
+		fl_source_init(&source, diag_name, diag_text);
+		diag_source = &source;
+	}
+	fl_diag_emit(stderr, &diag, diag_source, diag_format, diag_color);
+	if (temporary) {
+		fl_source_free(&source);
+		diag_source = NULL;
+	}
+	state.parser.had_error = true;
+	state.parser.error_count++;
 }
 
 static void error_at_current(const char *message)
@@ -235,8 +444,11 @@ static bool match(TokenType type)
  */
 static void emit_byte(uint8_t byte)
 {
-	chunk_write(
-	        state.vm, current_chunk(), byte, state.parser.previous.line);
+	chunk_write(state.vm,
+	        current_chunk(),
+	        byte,
+	        state.parser.previous.line,
+	        (uint32_t)state.parser.previous.offset);
 }
 
 static void emit_bytes(uint8_t byte1, uint8_t byte2)
@@ -271,7 +483,7 @@ static int make_constant(Value value)
 	int constant = chunk_add_constant(state.vm, current_chunk(), value);
 	vm_pop(state.vm);
 	if (constant < 0) {
-		error("Too many constants in one chunk.");
+		error("too many constants in one chunk.");
 		return 0; /* unreachable in practice: needs 16M constants */
 	}
 	return constant;
@@ -312,7 +524,7 @@ static void patch_jump(int offset)
 {
 	int jump = current_chunk()->count - offset - 2;
 	if (jump > UINT16_MAX)
-		error("Too much code to jump over.");
+		error("too much code to jump over.");
 	current_chunk()->code[offset] = (jump >> 8) & 0xff;
 	current_chunk()->code[offset + 1] = jump & 0xff;
 }
@@ -326,7 +538,7 @@ static void emit_loop(int loop_start)
 	emit_byte(OP_LOOP);
 	int offset = current_chunk()->count - loop_start + 2;
 	if (offset > UINT16_MAX)
-		error("Loop body too large.");
+		error("loop body too large.");
 	emit_byte((offset >> 8) & 0xff);
 	emit_byte(offset & 0xff);
 }
@@ -361,6 +573,8 @@ static void init_compiler(Compiler *compiler, FunctionType type)
 	local->is_const = false;
 	local->name.start = "";
 	local->name.length = 0;
+	local->name_offset = 0;
+	state.current->function->chunk.local_count = state.current->local_count;
 }
 
 /* Pop the compiler, emit the implicit return, and hand back the function. */
@@ -413,7 +627,7 @@ static void end_scope(void)
 static int identifier_constant(Token *name)
 {
 	return make_constant(
-	        OBJ_VAL(copy_string(state.vm, name->start, name->length)));
+	        STR_VAL(copy_string(state.vm, name->start, name->length)));
 }
 
 static bool identifiers_equal(Token *a, Token *b)
@@ -460,7 +674,7 @@ static int resolve_local(Compiler *compiler, Token *name)
 		Local *local = &compiler->locals[i];
 		if (identifiers_equal(name, &local->name)) {
 			if (local->depth == -1)
-				error("Can't read local variable in its own "
+				error("can't read local variable in its own "
 				      "initializer.");
 			return i;
 		}
@@ -480,7 +694,7 @@ static int add_upvalue(Compiler *compiler, uint8_t index, bool is_local)
 	}
 
 	if (upvalue_count == MAX_UPVALUES) {
-		error("Too many closure variables in function.");
+		error("too many closure variables in function.");
 		return 0;
 	}
 
@@ -525,15 +739,37 @@ static int resolve_upvalue(Compiler *compiler, Token *name)
 static void add_local(Token name, bool is_const)
 {
 	if (state.current->local_count == MAX_LOCALS) {
-		error("Too many local variables in function.");
+		error("too many local variables in function.");
 		return;
 	}
 
 	Local *local = &state.current->locals[state.current->local_count++];
 	local->name = name;
+	local->name_offset = (uint32_t)name.offset;
 	local->depth = -1;
 	local->is_captured = false;
 	local->is_const = is_const;
+
+	/*
+	 * Published on the chunk as each local is added, so the verifier can
+	 * check an OP_GET_LOCAL operand against something real. An operand is a
+	 * byte, so it can never exceed MAX_LOCALS and a check against that limit
+	 * catches nothing; only the function's own peak slot count means
+	 * anything.
+	 *
+	 * A peak, and only ever raised. Slots are reused: end_scope() drops
+	 * local_count back so a sibling scope can have the same slots, which
+	 * means the current count goes down and up across a function. Assigning
+	 * the current count here would lower the recorded peak when a later
+	 * scope happens to be shallower than an earlier one, and then every slot
+	 * index the earlier scope used would look out of range to the verifier.
+	 * That is not hypothetical: `for x in xs` followed by `for i in 0..n`
+	 * at the same level did exactly that.
+	 */
+	if (state.current->local_count >
+	        state.current->function->chunk.local_count)
+		state.current->function->chunk.local_count =
+		        state.current->local_count;
 }
 
 /*
@@ -552,9 +788,26 @@ static void declare_variable(bool is_const)
 		if (local->depth != -1 &&
 		        local->depth < state.current->scope_depth)
 			break;
-		if (identifiers_equal(name, &local->name))
-			error("Already a variable with this name in this "
-			      "scope.");
+		if (identifiers_equal(name, &local->name)) {
+			/* format the name into the message first. a
+			 * variadic call cannot interleave printf's own
+			 * arguments with positional ones, and reading it
+			 * that way is a very easy bug to ship. */
+			char message[160];
+			snprintf(message,
+			        sizeof(message),
+			        "variable `%.*s` is already defined in "
+			        "this scope",
+			        name->length,
+			        name->start);
+			state.parser.panic_mode = false;
+			error_with_label(message,
+			        (size_t)local->name_offset,
+			        (size_t)local->name_offset +
+			                (size_t)local->name.length,
+			        "first defined here");
+			break;
+		}
 	}
 	add_local(*name, is_const);
 }
@@ -639,7 +892,7 @@ static void parse_precedence(Precedence precedence)
 	advance();
 	ParseFn prefix_rule = get_rule(state.parser.previous.type)->prefix;
 	if (prefix_rule == NULL) {
-		error("Expect expression.");
+		error("expect expression.");
 		return;
 	}
 
@@ -667,7 +920,7 @@ static void parse_precedence(Precedence precedence)
 	        (match(TOKEN_EQUAL) || match(TOKEN_PLUS_EQUAL) ||
 	                match(TOKEN_MINUS_EQUAL) || match(TOKEN_STAR_EQUAL) ||
 	                match(TOKEN_SLASH_EQUAL)))
-		error("Invalid assignment target.");
+		error("invalid assignment target.");
 }
 
 static void number(bool can_assign)
@@ -749,7 +1002,7 @@ static void string(bool can_assign)
 
 	ObjString *str = copy_string(state.vm, chars, out);
 	free(chars);
-	emit_constant(OBJ_VAL(str));
+	emit_constant(STR_VAL(str));
 }
 
 static void emit_variable_op(uint8_t op, int arg)
@@ -790,7 +1043,7 @@ static void named_variable(Token name, bool can_assign)
 		 * has no way to know. that is a bug. */
 		if (get_op == OP_GET_LOCAL &&
 		        state.current->locals[arg].is_const) {
-			error("Can't assign to constant.");
+			error("can't assign to constant.");
 			return;
 		}
 		expression();
@@ -801,7 +1054,7 @@ static void named_variable(Token name, bool can_assign)
 	                   match(TOKEN_SLASH_EQUAL))) {
 		if (get_op == OP_GET_LOCAL &&
 		        state.current->locals[arg].is_const) {
-			error("Can't assign to constant.");
+			error("can't assign to constant.");
 			return;
 		}
 		TokenType op = state.parser.previous.type;
@@ -840,7 +1093,7 @@ static void grouping(bool can_assign)
 {
 	(void)can_assign;
 	expression();
-	consume(TOKEN_RIGHT_PAREN, "Expect ')' after expression.");
+	consume(TOKEN_RIGHT_PAREN, "expect ')' after expression.");
 }
 
 /* a prefix operator: parse tighter, then emit. postfix is below. */
@@ -972,7 +1225,7 @@ static void as_(bool can_assign)
 		return;
 	}
 
-	consume(TOKEN_IDENTIFIER, "Expect a type name after 'as'.");
+	consume(TOKEN_IDENTIFIER, "expect a type name after 'as'.");
 
 	int tag = -1;
 	if (identifier_is("number"))
@@ -991,7 +1244,7 @@ static void as_(bool can_assign)
 		tag = FL_TYPE_FUNCTION;
 
 	if (tag < 0) {
-		error("Unknown type name after 'as'. Expected one of: "
+		error("unknown type name after 'as'. Expected one of: "
 		      "number, string, bool, nil, list, table, function.");
 		return;
 	}
@@ -1007,11 +1260,11 @@ static uint8_t argument_list(void)
 		do {
 			expression();
 			if (argc == 255)
-				error("Can't have more than 255 arguments.");
+				error("can't have more than 255 arguments.");
 			argc++;
 		} while (match(TOKEN_COMMA));
 	}
-	consume(TOKEN_RIGHT_PAREN, "Expect ')' after arguments.");
+	consume(TOKEN_RIGHT_PAREN, "expect ')' after arguments.");
 	return argc;
 }
 
@@ -1037,9 +1290,9 @@ static void list_literal(bool can_assign)
 			count++;
 		} while (match(TOKEN_COMMA));
 	}
-	consume(TOKEN_RIGHT_BRACKET, "Expect ']' after list.");
+	consume(TOKEN_RIGHT_BRACKET, "expect ']' after list.");
 	if (count > 255)
-		error("Can't have more than 255 elements in a list literal.");
+		error("can't have more than 255 elements in a list literal.");
 	emit_bytes(OP_BUILD_LIST, (uint8_t)count);
 }
 
@@ -1047,7 +1300,7 @@ static void list_literal(bool can_assign)
 static void subscript(bool can_assign)
 {
 	expression();
-	consume(TOKEN_RIGHT_BRACKET, "Expect ']' after index.");
+	consume(TOKEN_RIGHT_BRACKET, "expect ']' after index.");
 
 	if (can_assign && match(TOKEN_EQUAL)) {
 		expression();
@@ -1061,7 +1314,7 @@ static void subscript(bool can_assign)
  * string literal to lex here. */
 static void dot(bool can_assign)
 {
-	consume(TOKEN_IDENTIFIER, "Expect field name after '.'.");
+	consume(TOKEN_IDENTIFIER, "expect field name after '.'.");
 	int name = identifier_constant(&state.parser.previous);
 
 	if (can_assign && match(TOKEN_EQUAL)) {
@@ -1095,10 +1348,10 @@ static void table_literal(bool can_assign)
 	if (!check(TOKEN_RIGHT_BRACE)) {
 		do {
 			consume(TOKEN_IDENTIFIER,
-			        "Expect key name in table literal.");
+			        "expect key name in table literal.");
 			int name = identifier_constant(&state.parser.previous);
 			consume(TOKEN_COLON,
-			        "Expect ':' after key in table literal.");
+			        "expect ':' after key in table literal.");
 
 			/*
 			 * The value is pushed on top of the table, and
@@ -1112,7 +1365,7 @@ static void table_literal(bool can_assign)
 			        OP_SET_FIELD_TOP, OP_SET_FIELD_TOP_LONG, name);
 		} while (match(TOKEN_COMMA));
 	}
-	consume(TOKEN_RIGHT_BRACE, "Expect '}' after table literal.");
+	consume(TOKEN_RIGHT_BRACE, "expect '}' after table literal.");
 }
 
 /*
@@ -1200,7 +1453,7 @@ static void consume_terminator(void)
 		return;
 	if (check(TOKEN_EOF) || check(TOKEN_RIGHT_BRACE))
 		return;
-	error_at_current("Expect ';' or newline after statement.");
+	error_at_current("expect ';' or newline after statement.");
 }
 
 /* statement parsing */
@@ -1209,7 +1462,7 @@ static void block(void)
 {
 	while (!check(TOKEN_RIGHT_BRACE) && !check(TOKEN_EOF))
 		declaration();
-	consume(TOKEN_RIGHT_BRACE, "Expect '}' after block.");
+	consume(TOKEN_RIGHT_BRACE, "expect '}' after block.");
 }
 
 /*
@@ -1232,7 +1485,7 @@ static void emit_close_upvalues_to(int depth)
 
 static void print_statement(void)
 {
-	consume(TOKEN_LEFT_PAREN, "Expect '(' after 'print'.");
+	consume(TOKEN_LEFT_PAREN, "expect '(' after 'print'.");
 	expression();
 	emit_byte(OP_PRINT);
 	/* print(a, b, c) is not a tuple, it is three prints. one opcode per
@@ -1241,7 +1494,7 @@ static void print_statement(void)
 		expression();
 		emit_byte(OP_PRINT);
 	}
-	consume(TOKEN_RIGHT_PAREN, "Expect ')' after arguments.");
+	consume(TOKEN_RIGHT_PAREN, "expect ')' after arguments.");
 	consume_terminator();
 }
 
@@ -1257,7 +1510,7 @@ static void if_statement(void)
 	int then_jump = emit_jump(OP_JUMP_IF_FALSE);
 	emit_byte(OP_POP); /* the condition, on the then path */
 
-	consume(TOKEN_LEFT_BRACE, "Expect '{' after if condition.");
+	consume(TOKEN_LEFT_BRACE, "expect '{' after if condition.");
 	begin_scope();
 	block();
 	end_scope();
@@ -1270,7 +1523,7 @@ static void if_statement(void)
 		if (match(TOKEN_IF)) {
 			if_statement(); /* else if, recursively */
 		} else {
-			consume(TOKEN_LEFT_BRACE, "Expect '{' after else.");
+			consume(TOKEN_LEFT_BRACE, "expect '{' after else.");
 			begin_scope();
 			block();
 			end_scope();
@@ -1301,7 +1554,7 @@ static void while_statement(void)
 	int exit_jump = emit_jump(OP_JUMP_IF_FALSE);
 	emit_byte(OP_POP);
 
-	consume(TOKEN_LEFT_BRACE, "Expect '{' after while condition.");
+	consume(TOKEN_LEFT_BRACE, "expect '{' after while condition.");
 	begin_scope();
 	block();
 	end_scope();
@@ -1332,9 +1585,9 @@ static void for_statement(void)
 {
 	begin_scope();
 
-	consume(TOKEN_IDENTIFIER, "Expect variable name after 'for'.");
+	consume(TOKEN_IDENTIFIER, "expect variable name after 'for'.");
 	Token var_name = state.parser.previous;
-	consume(TOKEN_IN, "Expect 'in' after for variable.");
+	consume(TOKEN_IN, "expect 'in' after for variable.");
 
 	/*
 	 * Anything that can start an expression. Asking the rules table beats
@@ -1360,7 +1613,8 @@ static void for_statement(void)
 			        " end",
 			        4,
 			        var_name.line,
-			        false};
+			        false,
+			        var_name.offset};
 			add_local(hidden, false);
 			mark_initialized();
 
@@ -1387,7 +1641,7 @@ static void for_statement(void)
 			emit_byte(OP_POP);
 
 			consume(TOKEN_LEFT_BRACE,
-			        "Expect '{' after for range.");
+			        "expect '{' after for range.");
 			begin_scope();
 			block();
 			end_scope();
@@ -1416,15 +1670,23 @@ static void for_statement(void)
 
 		/* List iteration. The list expression is already on the
 		 * stack, so it becomes the first hidden local. */
-		Token hidden_list = {
-		        TOKEN_IDENTIFIER, " list", 5, var_name.line, false};
+		Token hidden_list = {TOKEN_IDENTIFIER,
+		        " list",
+		        5,
+		        var_name.line,
+		        false,
+		        var_name.offset};
 		add_local(hidden_list, false);
 		mark_initialized();
 
 		/* the index starts at zero */
 		emit_constant(NUMBER_VAL(0));
-		Token hidden_idx = {
-		        TOKEN_IDENTIFIER, " idx", 4, var_name.line, false};
+		Token hidden_idx = {TOKEN_IDENTIFIER,
+		        " idx",
+		        4,
+		        var_name.line,
+		        false,
+		        var_name.offset};
 		add_local(hidden_idx, false);
 		mark_initialized();
 
@@ -1450,21 +1712,15 @@ static void for_statement(void)
 		/*
 		 * Condition: idx < len(list).
 		 *
-		 * There is no opcode for a list length, so the compiler
-		 * calls the len() native: push the global, push the list,
-		 * OP_CALL 1. That works, and it does mean for-in-over-a-list
-		 * calls a C function on every iteration. Emitting a real
-		 * OP_LIST_LEN would be a one-line VM change and a
-		 * two-line compiler change, if anyone ever profiles it.
+		 * OP_LIST_LEN reads the count out of the list header. It used
+		 * to load the `len` global, push the list, and make a real call
+		 * into C on every single iteration -- a global hash lookup, an
+		 * arity check and a native frame, to read an int that is
+		 * already in the object.
 		 */
 		emit_bytes(OP_GET_LOCAL, (uint8_t)idx_slot);
-
-		Token len_tok = {
-		        TOKEN_IDENTIFIER, "len", 3, var_name.line, false};
-		int len_const = identifier_constant(&len_tok);
-		emit_indexed(OP_GET_GLOBAL, OP_GET_GLOBAL_LONG, len_const);
 		emit_bytes(OP_GET_LOCAL, (uint8_t)list_slot);
-		emit_bytes(OP_CALL, 1);
+		emit_byte(OP_LIST_LEN);
 
 		emit_byte(OP_LESS);
 
@@ -1479,7 +1735,7 @@ static void for_statement(void)
 		emit_byte(OP_POP);
 
 		consume(TOKEN_LEFT_BRACE,
-		        "Expect '{' after for-in expression.");
+		        "expect '{' after for-in expression.");
 		begin_scope();
 		block();
 		end_scope();
@@ -1511,7 +1767,7 @@ static void for_statement(void)
 static void break_statement(void)
 {
 	if (state.loop == NULL) {
-		error("Can't use 'break' outside of a loop.");
+		error("can't use 'break' outside of a loop.");
 		return;
 	}
 
@@ -1519,7 +1775,7 @@ static void break_statement(void)
 
 	/* the offsets are patched once the loop body is complete */
 	if (state.loop->break_count >= 256) {
-		error("Too many break statements in loop.");
+		error("too many break statements in loop.");
 		return;
 	}
 	state.loop->break_jumps[state.loop->break_count++] = emit_jump(OP_JUMP);
@@ -1535,14 +1791,14 @@ static void break_statement(void)
 static void continue_statement(void)
 {
 	if (state.loop == NULL) {
-		error("Can't use 'continue' outside of a loop.");
+		error("can't use 'continue' outside of a loop.");
 		return;
 	}
 
 	emit_close_upvalues_to(state.loop->scope_depth);
 	if (state.loop->continue_target == -1) {
 		if (state.loop->continue_count >= 256) {
-			error("Too many continue statements in loop.");
+			error("too many continue statements in loop.");
 			return;
 		}
 		state.loop->continue_jumps[state.loop->continue_count++] =
@@ -1557,7 +1813,7 @@ static void return_statement(void)
 {
 	/* the top level is a function too, but it has no caller */
 	if (state.current->type == TYPE_SCRIPT)
-		error("Can't return from top-level code.");
+		error("can't return from top-level code.");
 
 	/* `return` with nothing after it is return nil */
 	if (check(TOKEN_SEMICOLON) || check(TOKEN_RIGHT_BRACE) ||
@@ -1571,10 +1827,31 @@ static void return_statement(void)
 }
 
 /* an expression statement. the result is discarded, so it is popped. */
+/*
+ * An expression used as a statement.
+ *
+ * In a script the value is thrown away, which is what OP_POP is for. At the
+ * repl it is not thrown away: a person who types `1 + 2` is asking what the
+ * answer is, and a repl that says nothing is a calculator with the screen
+ * off. So in echo mode the POP is left off and the value is left on the
+ * stack for the caller to print.
+ *
+ * The flag is checked against the script's own function, not "depth 0",
+ * because a nested function inside the repl input is a statement, not
+ * something to echo.
+ */
 static void expression_statement(void)
 {
 	expression();
 	consume_terminator();
+	if (state.echo_repl_value && state.current->type == TYPE_SCRIPT) {
+		state.left_value_on_stack = true;
+		/* return it rather than discarding it and falling out
+		 * through emit_return, which would push nil on top and
+		 * the repl would print nil every time. */
+		emit_byte(OP_RETURN);
+		return;
+	}
 	emit_byte(OP_POP);
 }
 
@@ -1622,28 +1899,28 @@ static void statement(void)
  */
 static void fn_declaration(void)
 {
-	int global = parse_variable("Expect function name.", false);
+	int global = parse_variable("expect function name.", false);
 	mark_initialized();
 
 	Compiler compiler;
 	init_compiler(&compiler, TYPE_FUNCTION);
 	begin_scope();
 
-	consume(TOKEN_LEFT_PAREN, "Expect '(' after function name.");
+	consume(TOKEN_LEFT_PAREN, "expect '(' after function name.");
 	if (!check(TOKEN_RIGHT_PAREN)) {
 		do {
 			/* one stack slot per parameter, in order */
 			state.current->function->arity++;
 			if (state.current->function->arity > 255)
 				error_at_current(
-				        "Can't have more than 255 parameters.");
+				        "can't have more than 255 parameters.");
 			int param =
-			        parse_variable("Expect parameter name.", false);
+			        parse_variable("expect parameter name.", false);
 			define_variable(param, false);
 		} while (match(TOKEN_COMMA));
 	}
-	consume(TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
-	consume(TOKEN_LEFT_BRACE, "Expect '{' before function body.");
+	consume(TOKEN_RIGHT_PAREN, "expect ')' after parameters.");
+	consume(TOKEN_LEFT_BRACE, "expect '{' before function body.");
 	block();
 
 	ObjFunction *function = end_compiler();
@@ -1662,7 +1939,7 @@ static void fn_declaration(void)
 /* let, with or without an initializer. no initializer means nil. */
 static void let_declaration(void)
 {
-	int global = parse_variable("Expect variable name.", false);
+	int global = parse_variable("expect variable name.", false);
 
 	if (match(TOKEN_EQUAL))
 		expression();
@@ -1677,9 +1954,9 @@ static void let_declaration(void)
  * be constant about. */
 static void const_declaration(void)
 {
-	int global = parse_variable("Expect variable name.", true);
+	int global = parse_variable("expect variable name.", true);
 
-	consume(TOKEN_EQUAL, "Expect '=' after const name.");
+	consume(TOKEN_EQUAL, "expect '=' after const name.");
 	expression();
 	consume_terminator();
 
@@ -1729,21 +2006,49 @@ static void synchronize(void)
  * result. The path is a raw string constant because escapes have already
  * been processed and a file path has no use for them.
  */
+/*
+ * `import "foo.fl"` and `import math` are the same statement with two
+ * spellings, because they are the same thing: ask the module loader for a
+ * source file. The loader decides whether the name is a relative path or a
+ * library.
+ *
+ * Keeping the distinction in one place matters. The alternative is a second
+ * import form for packages, and then the language has two module systems that
+ * have to be kept in agreement about what an import means. The package manager
+ * will sit in front of import_file(), not beside it.
+ */
 static void import_declaration(void)
 {
-	consume(TOKEN_STRING, "Expect module file path string after 'import'.");
-	Token path_token = state.parser.previous;
+	const char *src;
+	int len;
+	Token path_token;
+
+	if (match(TOKEN_STRING)) {
+		path_token = state.parser.previous;
+		/* the quotes are at both ends; the path is what is between */
+		src = path_token.start + 1;
+		len = path_token.length - 2;
+	} else if (match(TOKEN_IDENTIFIER)) {
+		path_token = state.parser.previous;
+		src = path_token.start;
+		len = path_token.length;
+	} else {
+		error("expect a module path or a library name after 'import'.");
+		return;
+	}
 	consume_terminator();
 
-	Token import_fn = {
-	        TOKEN_IDENTIFIER, "import_file", 11, path_token.line, false};
+	Token import_fn = {TOKEN_IDENTIFIER,
+	        "import_file",
+	        11,
+	        path_token.line,
+	        false,
+	        path_token.offset};
 	int fn_const = identifier_constant(&import_fn);
 	emit_indexed(OP_GET_GLOBAL, OP_GET_GLOBAL_LONG, fn_const);
 
-	const char *src = path_token.start + 1;
-	int len = path_token.length - 2;
 	ObjString *str = copy_string(state.vm, src, len);
-	emit_constant(OBJ_VAL(str));
+	emit_constant(STR_VAL(str));
 
 	emit_bytes(OP_CALL, 1);
 	emit_byte(OP_POP);
@@ -1765,7 +2070,7 @@ static void export_declaration(void)
 	} else if (match(TOKEN_CONST)) {
 		const_declaration();
 	} else {
-		error("Expect 'fn', 'let', or 'const' after 'export'.");
+		error("expect 'fn', 'let', or 'const' after 'export'.");
 	}
 }
 
@@ -1800,6 +2105,12 @@ static void declaration(void)
  */
 ObjFunction *compile(VM *vm, const char *source)
 {
+	return compile_named(vm, source, "<source>");
+}
+
+ObjFunction *compile_named(VM *vm, const char *source, const char *name)
+{
+	fix_count = 0;
 	/*
 	 * Own the compiler state for the duration of this compile.
 	 *
@@ -1817,15 +2128,25 @@ ObjFunction *compile(VM *vm, const char *source)
 	 * a few hundred bytes and about forty instructions.
 	 */
 	CompilerState saved = state;
+	/* echo mode is set by the repl before it calls in, and it is a
+	 * mode rather than per-compile state, so it has to survive the
+	 * save/restore below. left_value_on_stack is the per-compile
+	 * result and deliberately does not. */
+	bool echo_mode = state.echo_repl_value;
 
 	/* a fresh compile does not inherit the previous one's error state */
 	state.parser.had_error = false;
+	state.parser.error_count = 0;
+	state.parser.suppressed = false;
+	state.left_value_on_stack = false;
 	state.parser.panic_mode = false;
 	state.loop = NULL;
 	state.current = NULL;
 
 	state.vm = vm;
 	scanner_init(source);
+	diag_text = source;
+	diag_name = name;
 
 	Compiler compiler;
 	init_compiler(&compiler, TYPE_SCRIPT);
@@ -1834,6 +2155,20 @@ ObjFunction *compile(VM *vm, const char *source)
 
 	while (!match(TOKEN_EOF))
 		declaration();
+
+	/*
+	 * The summary. One line, and only when it is not obvious: if the
+	 * file did not compile, say how many things were wrong with it.
+	 * A reader who fixed the first error and ran again deserves to
+	 * know whether that was the whole job.
+	 */
+	if (state.parser.had_error) {
+		int n = state.parser.error_count;
+		fprintf(stderr,
+		        "\nerror: could not compile due to %d error%s\n",
+		        n,
+		        n == 1 ? "" : "s");
+	}
 
 	/*
 	 * end_compiler() pops the chain, which leaves state.current NULL. That
@@ -1850,7 +2185,10 @@ ObjFunction *compile(VM *vm, const char *source)
 	 * already a live heap object, so dropping the compiler chain does
 	 * not lose it: the caller roots it on the next line.
 	 */
+	bool left_value = state.left_value_on_stack;
 	state = saved;
+	state.echo_repl_value = echo_mode;
+	state.left_value_on_stack = left_value;
 
 	return failed ? NULL : function;
 }

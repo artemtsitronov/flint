@@ -11,6 +11,9 @@
 #include "chunk.h"
 #include "common.h"
 #include "compiler.h"
+#include "config.h"
+#include "diagnostic.h"
+#include "profile.h"
 /* the disassembler is called from run(), and only under
  * FL_DEBUG_TRACE_EXECUTION. Same reasoning as the compiler: an include that
  * nothing references in a release build is noise the analyser has to be told
@@ -53,23 +56,6 @@ static Value peek(VM *vm, int distance) { return vm->stack_top[-1 - distance]; }
 
 static void close_upvalues(VM *vm, Value *last);
 
-/*
- * Discard everything this script pushed: the frames above vm->base_frame, and
- * the stack above vm->base_top.
- *
- * Both, and the second one is not optional. Recovering the stack top from the
- * frame index is wrong, because a frame's base is where its *callee* sits, not
- * where the current statement began. An `import` at the top of a script has the
- * import_file callee and its path argument sitting above the frame base, and
- * call_value is about to subtract them itself. Unwinding to the frame base
- * throws them away first, so the subtraction runs off the bottom of the array
- * and writes there. That is silent corruption when it lands in the VM struct
- * and a segfault when it does not.
- *
- * So vm_interpret() records both on entry: the frame count to keep, and the
- * exact stack position to return to. A failure restores both, and the caller
- * finds its stack exactly as it left it.
- */
 /*
  * Discard everything this script added: the frames above base_frame, and the
  * value stack back down to base_top.
@@ -115,13 +101,369 @@ static void unwind_to(VM *vm, int base_frame, Value *base_top)
  * each frame is the line of the instruction *before* ip, because ip already
  * points past the opcode that failed.
  */
+static int name_distance(const char *a, size_t alen, const char *b, size_t blen)
+{
+	if (alen > 31 || blen > 31 || alen > blen + 2 || blen > alen + 2)
+		return 3;
+	int prev[32];
+	int next[32];
+	for (size_t j = 0; j <= blen; j++)
+		prev[j] = (int)j;
+	for (size_t i = 1; i <= alen; i++) {
+		next[0] = (int)i;
+		int row_min = next[0];
+		for (size_t j = 1; j <= blen; j++) {
+			int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+			int del = prev[j] + 1;
+			int ins = next[j - 1] + 1;
+			int sub = prev[j - 1] + cost;
+			int best = del < ins ? del : ins;
+			next[j] = best < sub ? best : sub;
+			if (next[j] < row_min)
+				row_min = next[j];
+		}
+		if (row_min > 2)
+			return 3;
+		memcpy(prev, next, (blen + 1) * sizeof(int));
+	}
+	return prev[blen];
+}
+
+/*
+ * Names a script might have meant that are not values.
+ *
+ * `print` is a keyword, not a global, so it is not in vm->globals and a
+ * search over globals alone can never suggest it. `pritn("x")` is the single
+ * most common typo in any language and it was reported with no help at all,
+ * because the one name the user wanted was in a different table.
+ *
+ * Keywords and the builtins are candidates for the same reason, and the
+ * search over both is bounded by construction: this list is fixed and the
+ * globals table is whatever the program defined.
+ */
+static const char *const language_names[] = {
+        "print",
+        "len",
+        "push",
+        "pop",
+        "str",
+        "type",
+        "input",
+        "clock",
+        "split",
+        "join",
+        "trim",
+        "contains",
+        "starts_with",
+        "ends_with",
+        "replace",
+        "lower",
+        "upper",
+        "args",
+        "env",
+        "exit",
+        "read_file",
+        "write_file",
+        "exec",
+        "let",
+        "const",
+        "if",
+        "else",
+        "while",
+        "for",
+        "fn",
+        "return",
+        "break",
+        "continue",
+        "import",
+        "export",
+        "in",
+        "and",
+        "or",
+        "not",
+        "nil",
+        "true",
+        "false",
+};
+
+/*
+ * The closest name to the needle, or NULL if nothing is close enough.
+ *
+ * Returns a static string from language_names, or a key borrowed from
+ * vm->globals. Both outlive the call: the static one trivially, the globals
+ * one because the table outlives the diagnostic.
+ */
+static const char *similar_language_name(VM *vm, ObjString *needle)
+{
+	const char *best = NULL;
+	int best_distance = 3;
+	bool tied = false;
+
+	for (size_t i = 0;
+	        i < sizeof(language_names) / sizeof(language_names[0]);
+	        i++) {
+		const char *name = language_names[i];
+		int distance = name_distance(needle->chars,
+		        (size_t)needle->length,
+		        name,
+		        strlen(name));
+		if (distance < best_distance) {
+			best = name;
+			best_distance = distance;
+			tied = false;
+		} else if (distance == best_distance) {
+			tied = true;
+		}
+	}
+
+	for (int i = 0; i < vm->globals.capacity; i++) {
+		ObjString *key = vm->globals.entries[i].key;
+		if (key == NULL)
+			continue;
+		if (best != NULL && strcmp(best, key->chars) == 0)
+			continue; /* already the best, from the list above */
+		int distance = name_distance(needle->chars,
+		        (size_t)needle->length,
+		        key->chars,
+		        (size_t)key->length);
+		if (distance < best_distance) {
+			best = key->chars;
+			best_distance = distance;
+			tied = false;
+		} else if (distance == best_distance) {
+			tied = true;
+		}
+	}
+
+	/* a tie means two candidates are equally close, and suggesting
+	 * either is a coin flip. say nothing instead. */
+	/*
+	 * A name can be in both tables -- every builtin is a global *and* is
+	 * listed above -- so the second pass can re-find the current best at
+	 * the same distance and tie with itself. Skip anything already the
+	 * best; a genuine tie between two *different* names is still a coin
+	 * flip and correctly says nothing.
+	 */
+	return tied || best == NULL ? NULL : best;
+}
+
+static const char *undefined_name(const char *message)
+{
+	static const char prefix[] = "undefined variable '";
+	if (strncmp(message, prefix, sizeof(prefix) - 1) != 0)
+		return NULL;
+	const char *start = message + sizeof(prefix) - 1;
+	const char *end = strchr(start, '\'');
+	if (end == NULL || end[1] != '.' || end[2] != '\0')
+		return NULL;
+	char *name = malloc((size_t)(end - start) + 1);
+	if (name == NULL)
+		return NULL;
+	memcpy(name, start, (size_t)(end - start));
+	name[end - start] = '\0';
+	return name;
+}
+
 void vm_runtime_error(VM *vm, const char *format, ...)
 {
 	va_list args;
 	va_start(args, format);
-	vfprintf(stderr, format, args);
+	va_list count_args;
+	/*
+	 * va_copy, because a va_list may be walked once.
+	 *
+	 * clang-analyzer-valist reports 'uninitialized value' on the
+	 * vsnprintf below and has for years. The sequence is the one C99
+	 * prescribes for using the arguments twice: va_start, then va_copy
+	 * into a second list, use both, va_end both. gcc -Wformat=2 agrees
+	 * that this is well formed.
+	 *
+	 * The annotation is here because the alternative -- restructuring to
+	 * avoid the copy -- means either a fixed-size buffer with a truncation
+	 * that can produce a wrong diagnostic, or formatting twice and
+	 * hoping the two agree. Neither is better than one annotated line.
+	 */
+	/* NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized) */
+	va_copy(count_args, args);
+	/* NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized) */
+	int length = vsnprintf(NULL, 0, format, count_args);
+	va_end(count_args);
+	char fallback[2048];
+	char *message = fallback;
+	if (length >= 0) {
+		message = malloc((size_t)length + 1);
+		if (message == NULL)
+			message = fallback;
+	}
+	vsnprintf(message,
+	        message == fallback ? sizeof(fallback) : (size_t)length + 1,
+	        format,
+	        args);
 	va_end(args);
-	fputs("\n", stderr);
+	if (vm->diag_format == FL_DIAG_LEGACY) {
+		fprintf(stderr, "%s\n", message);
+	} else {
+		FlSource source;
+		FlSource *source_ptr = NULL;
+		FlSpan span = {0, 0};
+		bool has_span = false;
+		const char *code = "E0600";
+		const char *primary_label = "runtime error";
+		const char *missing_name = undefined_name(message);
+		ObjString *missing =
+		        missing_name != NULL
+		                ? copy_string(vm,
+		                          missing_name,
+		                          (int)strlen(missing_name))
+		                : NULL;
+		const char *help[1];
+		size_t help_count = 0;
+		char help_text[128];
+		if (missing != NULL) {
+			code = "E0202";
+			primary_label = "undefined name";
+		} else if (strncmp(message,
+		                   "operands must be",
+		                   strlen("operands must be")) == 0) {
+			code = "E0301";
+			primary_label = "invalid operands";
+		} else if (strncmp(message,
+		                   "expected type '",
+		                   strlen("expected type '")) == 0) {
+			code = "E0302";
+			primary_label = "type assertion failed";
+		} else if (strstr(message, "index") != NULL) {
+			code = "E0601";
+			primary_label = "invalid index";
+		} else if (strncmp(message, "expected ", 9) == 0) {
+			code = "E0401";
+			primary_label = "call failed";
+		} else if (strstr(message, "module") != NULL ||
+		           strstr(message, "import cycle") != NULL) {
+			code = "E0501";
+			primary_label = "module operation failed";
+		}
+		if (vm->source_text != NULL) {
+			fl_source_init(
+			        &source, vm->source_name, vm->source_text);
+			source_ptr = &source;
+			if (source.line_count != 0 &&
+			        vm->frame_count > vm->base_frame) {
+				CallFrame *frame =
+				        &vm->frames[vm->frame_count - 1];
+				ObjFunction *fn = frame->closure->function;
+				size_t ip = (size_t)(frame->ip -
+				                     fn->chunk.code - 1);
+				size_t line = (size_t)fn->chunk.lines[ip];
+				if (line > 0 && line <= source.line_count) {
+					/*
+					 * Point at the instruction, not the
+					 * line. Each code byte records the
+					 * source offset it came from, and
+					 * the end of an instruction is the
+					 * start offset of the next, so the
+					 * span of the failing expression
+					 * falls out of two array reads.
+					 *
+					 * Underlining the whole line was
+					 * what made `print(xs[10])` show a
+					 * caret across the entire call.
+					 */
+					if (fn->chunk.spans != NULL &&
+					        ip < (size_t)fn->chunk.count) {
+						span.start =
+						        fn->chunk.spans[ip];
+						span.end =
+						        ip + 1 < (size_t)fn->chunk
+						                                .count
+						                ? fn->chunk.spans
+						                          [ip + 1]
+						                : span.start;
+					} else {
+						span.start =
+						        (uint32_t)source
+						                .line_starts[line -
+						                             1];
+					}
+					if (span.end <= span.start) {
+						/* a zero-width span: fall back
+						 * to the rest of the line, which
+						 * is what it was before, and is
+						 * better than pointing at
+						 * nothing */
+						span.start =
+						        (uint32_t)source
+						                .line_starts[line -
+						                             1];
+					}
+					if (span.end == span.start) {
+						size_t end = span.start;
+						while (end < source.length &&
+						        source.text[end] !=
+						                '\n')
+							end++;
+						span.end = (uint32_t)end;
+					}
+					/* never run past the end of the
+					 * source, whatever the tables say */
+					if (span.end > source.length)
+						span.end =
+						        (uint32_t)source.length;
+					has_span = true;
+					if (missing != NULL) {
+						size_t name_len =
+						        (size_t)missing->length;
+						size_t at = span.start;
+						while (at + name_len <=
+						                span.end &&
+						        memcmp(source.text + at,
+						                missing->chars,
+						                name_len) != 0)
+							at++;
+						if (at + name_len <= span.end) {
+							span.start =
+							        (uint32_t)at;
+							span.end =
+							        (uint32_t)(at +
+							                   name_len);
+						}
+						const char *similar =
+						        similar_language_name(
+						                vm, missing);
+						if (similar != NULL) {
+							snprintf(help_text,
+							        sizeof(help_text),
+							        "did you mean "
+							        "`%s`?",
+							        similar);
+							help[0] = help_text;
+							help_count = 1;
+						}
+					}
+				}
+			}
+		}
+		FlDiagnostic diag = {
+		        .severity = FL_DIAG_ERROR,
+		        .code = code,
+		        .message = message,
+		        .primary = span,
+		        .has_primary = has_span,
+		        .primary_label = primary_label,
+		        .help = help,
+		        .help_count = help_count,
+		};
+		fl_diag_emit(stderr,
+		        &diag,
+		        source_ptr,
+		        vm->diag_format,
+		        vm->diag_color);
+		if (source_ptr != NULL)
+			fl_source_free(&source);
+		free((void *)missing_name);
+	}
+	if (message != fallback)
+		free(message);
 
 	/*
 	 * Only the frames this script owns. The importing script's frames
@@ -129,7 +471,11 @@ void vm_runtime_error(VM *vm, const char *format, ...)
 	 * them would attribute a module's failure to a line in the importer
 	 * that ran long before it.
 	 */
-	for (int i = vm->frame_count - 1; i >= vm->base_frame; i--) {
+	for (int i = vm->frame_count - 1;
+	        i >= vm->base_frame &&
+	        (vm->diag_format == FL_DIAG_LEGACY ||
+	                vm->diag_format == FL_DIAG_HUMAN);
+	        i--) {
 		CallFrame *frame = &vm->frames[i];
 		ObjFunction *function = frame->closure->function;
 		size_t instruction = frame->ip - function->chunk.code - 1;
@@ -166,7 +512,7 @@ void vm_runtime_error(VM *vm, const char *format, ...)
  * bound is what makes the negative branch safe, because |d| <= count means
  * count + idx cannot overflow, and count is an int to begin with.
  *
- * `what` is "List" or "String" and only appears in the message.
+ * `what` is "list" or "string" and only appears in the message.
  */
 static bool value_to_index(
         VM *vm, Value value, int count, int *out, const char *what)
@@ -224,7 +570,7 @@ static bool value_to_index(
  */
 void vm_define_native(VM *vm, const char *name, NativeFn function, int arity)
 {
-	vm_push(vm, OBJ_VAL(copy_string(vm, name, (int)strlen(name))));
+	vm_push(vm, STR_VAL(copy_string(vm, name, (int)strlen(name))));
 	vm_push(vm, OBJ_VAL(new_native(vm, function, arity)));
 	table_set(vm, &vm->globals, AS_STRING(vm->stack[0]), vm->stack[1]);
 	vm_pop(vm);
@@ -250,28 +596,82 @@ void vm_init(VM *vm)
 	vm->frame_count = 0;
 	vm->open_upvalues = NULL;
 	vm->base_frame = 0;
+	vm->source_text = NULL;
+	vm->source_name = "<source>";
+	vm->warnings = FL_WARN_DEFAULT;
+	vm->repl_leaves_value = false;
+	vm->diag_format = FL_DIAG_LEGACY;
+	vm->diag_color = FL_COLOR_AUTO;
+	vm->verify = true;
 
 	vm->objects = NULL;
 	vm->bytes_allocated = 0;
-	/* first collection after a megabyte, so startup does not collect.
-	 * the multiply is size_t so it is done in the type it is stored
-	 * in, rather than in int and widening afterwards. */
-	vm->next_gc = (size_t)1024 * 1024;
+	/*
+	 * The counters start at zero, which is the one time they are memset
+	 * rather than assigned individually. vm_init has to clear the whole
+	 * struct anyway -- it is inside the caller's frame, so it is whatever
+	 * was there before -- and listing forty fields here to assign them one
+	 * at a time is a list that has to be edited every time a counter is
+	 * added.
+	 */
+	memset(&vm->counters, 0, sizeof(vm->counters));
+	/*
+	 * first collection after a megabyte, so startup does not collect.
+	 * see FL_GC_FIRST_THRESHOLD in config.h for why this is a floor and
+	 * not just a multiple of a live set that does not exist yet.
+	 */
+	vm->next_gc = FL_GC_FIRST_THRESHOLD;
 	vm->gray_count = 0;
 	vm->gray_capacity = 0;
 	vm->gray_stack = NULL;
 
 	table_init(&vm->globals);
 	table_init(&vm->strings);
+	table_init(&vm->modules);
+	compiler_set_diagnostics(NULL, vm->diag_format, vm->diag_color);
 
 	register_natives(vm);
 }
 
+void vm_set_diagnostics(VM *vm, FlDiagFormat format, FlColorMode color)
+{
+	vm->diag_format = format;
+	vm->diag_color = color;
+	compiler_set_diagnostics(NULL, format, color);
+}
+
+bool vm_pop_value(VM *vm, Value *out)
+{
+	if (vm->stack_top <= vm->stack)
+		return false;
+	vm->stack_top--;
+	*out = *vm->stack_top;
+	return true;
+}
+
 void vm_free(VM *vm)
 {
+	/*
+	 * Objects first, then the tables.
+	 *
+	 * The reverse order looks harmless and is not. free_objects() calls
+	 * free_object(), which calls fl_reallocate(), which can trigger a
+	 * collection. That collection calls mark_roots(), which reads
+	 * vm->globals. If the globals table has already been freed, the mark
+	 * phase walks freed memory and the collector either faults or, worse,
+	 * follows a pointer out of it.
+	 *
+	 * The general rule: freeing anything while a collector can still run
+	 * requires the roots to still be readable, so the reachable structure
+	 * has to outlive the objects that point into it. The strings table
+	 * holds weak references to objects, which is why it has to go after
+	 * the sweep and not before it -- the same ordering requirement,
+	 * pointing the other way.
+	 */
+	free_objects(vm);
 	table_free(vm, &vm->globals);
 	table_free(vm, &vm->strings);
-	free_objects(vm);
+	table_free(vm, &vm->modules);
 }
 
 /*
@@ -302,6 +702,16 @@ static void print_flint_value(Value value)
 		 * the range test has to happen inside the helper, before the
 		 * cast: see the note on fl_double_is_printable_int. */
 		if (fl_double_is_printable_int(d)) {
+			/* the digit loop, not printf("%ld"). small integers
+			 * are the common case and a libc format call is
+			 * ~250ns for something this is twenty nanoseconds of. */
+			char small[24];
+			int n = fl_itoa(
+			        fl_double_to_long(d), small, sizeof(small));
+			if (n > 0) {
+				printf("%s\n", small);
+				return;
+			}
 			printf("%ld\n", fl_double_to_long(d));
 			return;
 		}
@@ -332,6 +742,11 @@ static void print_flint_value(Value value)
 	}
 }
 
+/* formats any value the way print() does, plus a newline. the repl needs it,
+ * and duplicating the number formatting would be a second copy of the rule that
+ * fixes a floating-to-integer cast. */
+void vm_print_value(Value value) { print_flint_value(value); }
+
 /*
  * Push a frame for a flint function. The callee and its arguments are already
  * on the stack, so slots points at the callee and argument 0 is slots[1].
@@ -342,14 +757,14 @@ static bool call(VM *vm, ObjClosure *closure, int arg_count)
 {
 	if (arg_count != closure->function->arity) {
 		vm_runtime_error(vm,
-		        "Expected %d arguments but got %d.",
+		        "expected %d arguments but got %d.",
 		        closure->function->arity,
 		        arg_count);
 		return false;
 	}
 
 	if (vm->frame_count == FRAMES_MAX) {
-		vm_runtime_error(vm, "Stack overflow.");
+		vm_runtime_error(vm, "stack overflow.");
 		return false;
 	}
 
@@ -371,16 +786,27 @@ static bool call(VM *vm, ObjClosure *closure, int arg_count)
  */
 static bool call_value(VM *vm, Value callee, int arg_count)
 {
+	vm->counters.calls++;
 	if (IS_OBJ(callee)) {
 		switch (OBJ_TYPE(callee)) {
-		case OBJ_CLOSURE:
-			return call(vm, AS_CLOSURE(callee), arg_count);
+		case OBJ_CLOSURE: {
+			ObjClosure *closure = AS_CLOSURE(callee);
+			/*
+			 * Hotness lives on the function, not the closure. Two
+			 * closures over one function are the same code and would
+			 * be compiled twice, which is the same waste as compiling
+			 * a loop twice.
+			 */
+			closure->function->call_count++;
+			return call(vm, closure, arg_count);
+		}
 		case OBJ_NATIVE: {
 			ObjNative *native = AS_NATIVE(callee);
+			vm->counters.primitives++;
 			/* arity -1 is variadic and skips the check */
 			if (native->arity != -1 && arg_count != native->arity) {
 				vm_runtime_error(vm,
-				        "Expected %d arguments but got %d.",
+				        "expected %d arguments but got %d.",
 				        native->arity,
 				        arg_count);
 				return false;
@@ -396,7 +822,7 @@ static bool call_value(VM *vm, Value callee, int arg_count)
 			break;
 		}
 	}
-	vm_runtime_error(vm, "Can only call functions.");
+	vm_runtime_error(vm, "can only call functions.");
 	return false;
 }
 
@@ -472,21 +898,26 @@ static bool concatenate(VM *vm)
 	 * alternative is undefined behaviour and a confusing crash.
 	 */
 	if (a->length > INT_MAX - b->length) {
-		vm_runtime_error(vm, "String is too long to concatenate.");
+		vm_runtime_error(vm, "string is too long to concatenate.");
 		return false;
 	}
 
-	int length = a->length + b->length;
-	char *chars = ALLOCATE(vm, char, length + 1);
-	memcpy(chars, a->chars, a->length);
-	memcpy(chars + a->length, b->chars, b->length);
-	chars[length] = '\0';
-
-	/* take_string frees chars, and both operands are still rooted. */
-	ObjString *result = take_string(vm, chars, length);
+	/*
+	 * The result is not interned. It used to be, on the theory that a
+	 * repeated concatenation would then be free, and the theory is wrong in
+	 * both halves: a repeated concatenation is a loop that builds a *new*
+	 * string each time, so the repeats are not the same bytes and the
+	 * interning never hits; and the cost is paid every time whether or not
+	 * anything looks the result up again.
+	 *
+	 * Both operands are rooted across the allocation inside
+	 * concat_strings(), so this pops them after the result exists rather
+	 * than before it.
+	 */
+	ObjString *result = concat_strings(vm, a, b);
 	vm_pop(vm);
 	vm_pop(vm);
-	vm_push(vm, OBJ_VAL(result));
+	vm_push(vm, STR_VAL(result));
 	return true;
 }
 
@@ -540,7 +971,7 @@ static InterpretResult run(VM *vm, int base_frame)
 #define BINARY_OP(value_type, op)                                              \
 	do {                                                                   \
 		if (!IS_NUMBER(peek(vm, 0)) || !IS_NUMBER(peek(vm, 1))) {      \
-			vm_runtime_error(vm, "Operands must be numbers.");     \
+			vm_runtime_error(vm, "operands must be numbers.");     \
 			return INTERPRET_RUNTIME_ERROR;                        \
 		}                                                              \
 		double b = AS_NUMBER(vm_pop(vm));                              \
@@ -620,7 +1051,7 @@ static InterpretResult run(VM *vm, int base_frame)
 			Value value;
 			if (!table_get(&vm->globals, name, &value)) {
 				vm_runtime_error(vm,
-				        "Undefined variable '%s'.",
+				        "undefined variable '%s'.",
 				        name->chars);
 				return INTERPRET_RUNTIME_ERROR;
 			}
@@ -647,7 +1078,7 @@ static InterpretResult run(VM *vm, int base_frame)
 			if (table_is_const(&vm->globals, name)) {
 				vm_pop(vm);
 				vm_runtime_error(vm,
-				        "Cannot redefine constant '%s'.",
+				        "cannot redefine constant '%s'.",
 				        name->chars);
 				return INTERPRET_RUNTIME_ERROR;
 			}
@@ -688,7 +1119,7 @@ static InterpretResult run(VM *vm, int base_frame)
 				}
 				vm_pop(vm);
 				vm_runtime_error(vm,
-				        "Cannot redefine constant '%s'.",
+				        "cannot redefine constant '%s'.",
 				        name->chars);
 				return INTERPRET_RUNTIME_ERROR;
 			}
@@ -714,7 +1145,7 @@ static InterpretResult run(VM *vm, int base_frame)
 			 */
 			if (table_is_const(&vm->globals, name)) {
 				vm_runtime_error(vm,
-				        "Cannot assign to constant '%s'.",
+				        "cannot assign to constant '%s'.",
 				        name->chars);
 				return INTERPRET_RUNTIME_ERROR;
 			}
@@ -724,7 +1155,7 @@ static InterpretResult run(VM *vm, int base_frame)
 				 * just created it. undo that and complain. */
 				table_delete(&vm->globals, name);
 				vm_runtime_error(vm,
-				        "Undefined variable '%s'.",
+				        "undefined variable '%s'.",
 				        name->chars);
 				return INTERPRET_RUNTIME_ERROR;
 			}
@@ -773,7 +1204,7 @@ static InterpretResult run(VM *vm, int base_frame)
 
 			if (!value_has_type(value, want)) {
 				vm_runtime_error(vm,
-				        "Expected type '%s' but got '%s'.",
+				        "expected type '%s' but got '%s'.",
 				        flint_type_name_of(want),
 				        flint_type_name(value));
 				return INTERPRET_RUNTIME_ERROR;
@@ -814,7 +1245,7 @@ static InterpretResult run(VM *vm, int base_frame)
 				vm_push(vm, NUMBER_VAL(a + b));
 			} else {
 				vm_runtime_error(vm,
-				        "Operands must be two numbers or two "
+				        "operands must be two numbers or two "
 				        "strings.");
 				return INTERPRET_RUNTIME_ERROR;
 			}
@@ -834,7 +1265,7 @@ static InterpretResult run(VM *vm, int base_frame)
 			if (!IS_NUMBER(peek(vm, 0)) ||
 			        !IS_NUMBER(peek(vm, 1))) {
 				vm_runtime_error(
-				        vm, "Operands must be numbers.");
+				        vm, "operands must be numbers.");
 				return INTERPRET_RUNTIME_ERROR;
 			}
 			double b = AS_NUMBER(vm_pop(vm));
@@ -848,7 +1279,7 @@ static InterpretResult run(VM *vm, int base_frame)
 		case OP_NEGATE: {
 			if (!IS_NUMBER(peek(vm, 0))) {
 				vm_runtime_error(
-				        vm, "Operand must be a number.");
+				        vm, "operand must be a number.");
 				return INTERPRET_RUNTIME_ERROR;
 			}
 			vm_push(vm, NUMBER_VAL(-AS_NUMBER(vm_pop(vm))));
@@ -874,8 +1305,18 @@ static InterpretResult run(VM *vm, int base_frame)
 		}
 		case OP_LOOP: {
 			/* signed 16-bit backward offset, negated on the way in */
+			/*
+			 * signed 16-bit backward offset, negated on the way in
+			 *
+			 * This is the only backward branch in the instruction set,
+			 * which makes it the loop counter. Counting it here rather
+			 * than trying to recognize loop shapes in the bytecode is
+			 * one increment, and it is exactly right: a loop is
+			 * whatever this instruction is in.
+			 */
 			uint16_t offset = READ_SHORT();
 			frame->ip -= offset;
+			vm->counters.backedges++;
 			break;
 		}
 		case OP_CALL: {
@@ -944,11 +1385,20 @@ static InterpretResult run(VM *vm, int base_frame)
 			close_upvalues(vm, frame->slots);
 			vm->frame_count--;
 			if (vm->frame_count == base_frame) {
-				/* the frame this run() started with. pop its
-				 * closure and stop: there is no caller inside this
-				 * run() to return to, even though the VM may
-				 * still hold frames from an outer script. */
-				vm_pop(vm);
+				/* the frame this run() started with, and there
+				 * is no caller inside this run() to return to.
+				 *
+				 * the closure sits at frame->slots, and the
+				 * result was just popped from above it. when a
+				 * repl asked for the result to be left on the
+				 * stack, frame->slots is the wrong thing to pop,
+				 * so the value goes back and the stack is left
+				 * as the caller expects. */
+				if (vm->repl_leaves_value) {
+					vm_push(vm, result);
+				} else {
+					vm_pop(vm);
+				}
 				return INTERPRET_OK;
 			}
 
@@ -956,7 +1406,28 @@ static InterpretResult run(VM *vm, int base_frame)
 			 * then leave the result where the callee was */
 			vm->stack_top = frame->slots;
 			vm_push(vm, result);
+			vm->counters.returns++;
 			frame = &vm->frames[vm->frame_count - 1];
+			break;
+		}
+		case OP_LIST_LEN: {
+			/*
+			 * The list's own count, in place like a cast.
+			 *
+			 * The error is the one len() reports, and it is checked
+			 * rather than assumed: a script can shadow `len` with its
+			 * own function, so for-in-over-a-table is legal-looking
+			 * and has to fail the way it always did.
+			 */
+			Value target = peek(vm, 0);
+			if (!IS_LIST(target)) {
+				vm_runtime_error(vm,
+				        "argument to len() must be a string or "
+				        "list.");
+				return INTERPRET_RUNTIME_ERROR;
+			}
+			vm->stack_top[-1] =
+			        NUMBER_VAL((double)AS_LIST(target)->count);
 			break;
 		}
 		case OP_BUILD_LIST: {
@@ -1006,7 +1477,7 @@ static InterpretResult run(VM *vm, int base_frame)
 				            index_val,
 				            list->count,
 				            &idx,
-				            "List"))
+				            "list"))
 					return INTERPRET_RUNTIME_ERROR;
 				vm_push(vm, list->items[idx]);
 			} else if (IS_STRING(target)) {
@@ -1018,17 +1489,17 @@ static InterpretResult run(VM *vm, int base_frame)
 				            index_val,
 				            str->length,
 				            &idx,
-				            "String"))
+				            "string"))
 					return INTERPRET_RUNTIME_ERROR;
 				/* the byte goes into a C local before copy_string(),
 				 * which can collect. `str` is rooted and will not be
 				 * freed, but reading through a pointer the collector
 				 * just walked past is a habit not worth forming. */
 				char c[2] = {str->chars[idx], '\0'};
-				vm_push(vm, OBJ_VAL(copy_string(vm, c, 1)));
+				vm_push(vm, STR_VAL(copy_string(vm, c, 1)));
 			} else {
 				vm_runtime_error(vm,
-				        "Can only index lists and strings.");
+				        "can only index lists and strings.");
 				return INTERPRET_RUNTIME_ERROR;
 			}
 			break;
@@ -1042,7 +1513,7 @@ static InterpretResult run(VM *vm, int base_frame)
 			 * append syntax; use push(). */
 			if (!IS_LIST(target)) {
 				vm_runtime_error(
-				        vm, "Can only index-assign to lists.");
+				        vm, "can only index-assign to lists.");
 				return INTERPRET_RUNTIME_ERROR;
 			}
 			ObjList *list = AS_LIST(target);
@@ -1052,7 +1523,7 @@ static InterpretResult run(VM *vm, int base_frame)
 			 * bug, and one of them being checked is worse than
 			 * neither. */
 			if (!value_to_index(
-			            vm, index_val, list->count, &idx, "List"))
+			            vm, index_val, list->count, &idx, "list"))
 				return INTERPRET_RUNTIME_ERROR;
 			list->items[idx] = val;
 			vm_push(vm, val); /* assignment yields the value */
@@ -1083,7 +1554,7 @@ static InterpretResult run(VM *vm, int base_frame)
 field_done:;
 			} else {
 				vm_runtime_error(
-				        vm, "Only tables have fields.");
+				        vm, "only tables have fields.");
 				return INTERPRET_RUNTIME_ERROR;
 			}
 			break;
@@ -1126,7 +1597,7 @@ field_done:;
 field_set_done:;
 			} else {
 				vm_runtime_error(
-				        vm, "Only tables have fields.");
+				        vm, "only tables have fields.");
 				return INTERPRET_RUNTIME_ERROR;
 			}
 			break;
@@ -1153,7 +1624,7 @@ field_set_done:;
 
 			if (!IS_FLINT_TABLE(target)) {
 				vm_runtime_error(
-				        vm, "Only tables have fields.");
+				        vm, "only tables have fields.");
 				return INTERPRET_RUNTIME_ERROR;
 			}
 
@@ -1206,6 +1677,84 @@ field_set_done:;
 			 * disassembler agree on the opcode list.
 			 */
 			break;
+
+		/*
+		 * Specialized numeric ops: no type check, straight arithmetic.
+		 * The compiler emits these when both operands are provably
+		 * numbers (e.g. literal + literal, or typed locals). The
+		 * savings is the tag test and branch that OP_ADD etc. pay.
+		 */
+		case OP_ADD_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, NUMBER_VAL(a + b));
+			break;
+		}
+		case OP_SUB_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, NUMBER_VAL(a - b));
+			break;
+		}
+		case OP_MUL_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, NUMBER_VAL(a * b));
+			break;
+		}
+		case OP_DIV_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, NUMBER_VAL(a / b));
+			break;
+		}
+		case OP_MOD_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, NUMBER_VAL(fmod(a, b)));
+			break;
+		}
+		case OP_LT_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, BOOL_VAL(a < b));
+			break;
+		}
+		case OP_LE_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, BOOL_VAL(a <= b));
+			break;
+		}
+		case OP_GT_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, BOOL_VAL(a > b));
+			break;
+		}
+		case OP_GE_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, BOOL_VAL(a >= b));
+			break;
+		}
+		case OP_EQ_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, BOOL_VAL(a == b));
+			break;
+		}
+		case OP_NEQ_NUM: {
+			double b = AS_NUMBER(vm_pop(vm));
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, BOOL_VAL(a != b));
+			break;
+		}
+		case OP_NEG_NUM: {
+			double a = AS_NUMBER(vm_pop(vm));
+			vm_push(vm, NUMBER_VAL(-a));
+			break;
+		}
 		}
 	}
 
@@ -1225,6 +1774,41 @@ field_set_done:;
  */
 InterpretResult vm_interpret(VM *vm, const char *source)
 {
+	return vm_interpret_named(vm, source, "<source>");
+}
+
+InterpretResult vm_interpret_named(VM *vm, const char *source, const char *name)
+{
+	ObjFunction *function = compile_named(vm, source, name);
+	if (function == NULL)
+		return INTERPRET_COMPILE_ERROR;
+	return vm_interpret_function(vm, function, source, name);
+}
+
+/*
+ * Run an already-compiled function.
+ *
+ * Everything about the entry sequence lives here: base frame, base stack top,
+ * verification, and the closure-and-call that starts execution. The stack
+ * unwinding and restoration are the same in every case, which is why
+ * vm_interpret_named() is now a two-line wrapper.
+ */
+InterpretResult vm_interpret_function(
+        VM *vm, ObjFunction *function, const char *source, const char *name)
+{
+	const char *saved_text = vm->source_text;
+	const char *saved_name = vm->source_name;
+	/*
+	 * Publish the source for the whole run. vm_runtime_error() reads
+	 * vm->source_text to place a span and a caret, so this has to be set
+	 * here rather than only around the compile -- which is what
+	 * vm_interpret_named() used to do, back when compiling and running were
+	 * one function. Splitting them left it unset, and the symptom was
+	 * runtime errors with a code and a message and no span, which reads as
+	 * "there is no location" rather than "the caller forgot".
+	 */
+	vm->source_text = source;
+	vm->source_name = name;
 	/*
 	 * Reentrant, in two independent ways.
 	 *
@@ -1259,12 +1843,6 @@ InterpretResult vm_interpret(VM *vm, const char *source)
 	vm->base_frame = base_frame;
 	vm->base_top = base_top;
 
-	ObjFunction *function = compile(vm, source);
-	if (function == NULL) {
-		vm->base_frame = saved_base;
-		return INTERPRET_COMPILE_ERROR;
-	}
-
 	/*
 	 * The function is rooted on the stack across the new_closure() call,
 	 * which can collect. After the closure exists the function is
@@ -1283,6 +1861,8 @@ InterpretResult vm_interpret(VM *vm, const char *source)
 	if (!call(vm, closure, 0)) {
 		unwind_to(vm, base_frame, base_top);
 		vm->base_frame = saved_base;
+		vm->source_text = saved_text;
+		vm->source_name = saved_name;
 		return INTERPRET_RUNTIME_ERROR;
 	}
 
@@ -1296,7 +1876,16 @@ InterpretResult vm_interpret(VM *vm, const char *source)
 	 * the same position for the caller that is about to do its own
 	 * arithmetic on it.
 	 */
-	vm->stack_top = base_top;
+	/*
+	 * The repl is the one case where the stack is deliberately not
+	 * restored: it asked for the value of the last expression and
+	 * OP_RETURN left it above the frame's closure. handing back
+	 * base_top here would throw away the answer the repl is about
+	 * to print, and a repl that throws away the answer is the
+	 * thing this whole path exists to avoid.
+	 */
+	if (!vm->repl_leaves_value)
+		vm->stack_top = base_top;
 	vm->frame_count = base_frame;
 
 	/*
@@ -1304,6 +1893,8 @@ InterpretResult vm_interpret(VM *vm, const char *source)
 	 * start and not to this script's.
 	 */
 	vm->base_frame = saved_base;
+	vm->source_text = saved_text;
+	vm->source_name = saved_name;
 
 	return result;
 }

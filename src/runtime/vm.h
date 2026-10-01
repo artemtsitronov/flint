@@ -7,14 +7,31 @@
 
 #include "chunk.h"
 #include "object.h"
+#include "profile.h"
 #include "table.h"
 #include "value.h"
+#include "../util/diagnostic.h"
 
 typedef enum {
 	INTERPRET_OK,
 	INTERPRET_COMPILE_ERROR,
 	INTERPRET_RUNTIME_ERROR
 } InterpretResult;
+
+/*
+ * How much to say.
+ *
+ * FL_WARN_DEFAULT is the only mode that reports anything today: flint emits
+ * no warnings at all yet, and a flag that pretends otherwise would be a lie
+ * dressed as a feature. The modes exist so that the first real warning has
+ * somewhere to go, and so a script that wants a quiet run can ask for one
+ * without a second language.
+ */
+typedef enum {
+	FL_WARN_NONE = 0, /* errors only */
+	FL_WARN_DEFAULT, /* errors, and warnings once there are any */
+	FL_WARN_ALL /* everything the compiler can produce */
+} FlWarnMode;
 
 /*
  * One entry per active call. slots points at the callee value on the value
@@ -48,6 +65,27 @@ struct VM {
 	 */
 	int base_frame;
 	Value *base_top;
+	const char *source_text;
+	const char *source_name;
+	FlWarnMode warnings;
+	bool quiet; /* suppress the repl prompt */
+	/* the repl asked for an expression statement's value to be left on
+	 * the stack. it changes what OP_RETURN does at the base frame,
+	 * where the value sits above the frame's closure rather than
+	 * being the thing the return pops. */
+	bool repl_leaves_value;
+	/*
+	 * Run the bytecode verifier before executing.
+	 *
+	 * On by default and not a debugging option: the JIT depends on it,
+	 * and a build flag that a user can turn off does not make the JIT
+	 * safer, it only makes it untestable. The flag exists so that
+	 * --check can measure the cost, and so a future path that has
+	 * already verified the same chunk can skip the repeat pass.
+	 */
+	bool verify;
+	FlDiagFormat diag_format;
+	FlColorMode diag_color;
 
 	Value stack[STACK_MAX];
 	Value *stack_top;
@@ -55,11 +93,42 @@ struct VM {
 	Table globals; /* name -> value, for top-level variables */
 	Table strings; /* weak. the intern table. */
 
+	/*
+	 * Modules already loaded, keyed by resolved path.
+	 *
+	 * The value is a marker, not data: TRUE means loaded, NIL means
+	 * currently being loaded. That distinction is what detects a cycle
+	 * without a second table, and it is the whole reason the value
+	 * exists rather than being a plain set.
+	 *
+	 * A module runs once per VM. Importing it again is a no-op, which
+	 * means a library's top-level side effects happen once no matter
+	 * how many files pull it in, and a mutual import between two files
+	 * is an error naming the file already in flight rather than a
+	 * stack overflow.
+	 */
+	Table modules;
+
 	ObjUpvalue *open_upvalues; /* sorted by descending stack address */
 	Obj *objects; /* every live object, for sweeping */
 
 	size_t bytes_allocated;
 	size_t next_gc;
+
+	/*
+	 * Counters, and the one switch that decides whether anything writes
+	 * to them. `profile` is what --profile sets; `counters` is always
+	 * there because the collector needs the byte total anyway and
+	 * splitting the two would mean two sources for one number.
+	 *
+	 * The counters are incremented unconditionally. A branch on
+	 * vm->profile around every increment would be a load and a
+	 * predictable test on every allocation in the program, which is
+	 * exactly the kind of tax a release build should not pay for a mode
+	 * that is off. Writing a counter is a load and a store to a struct
+	 * the VM already owns, so it is cheaper than the branch would be.
+	 */
+	FlCounters counters;
 
 	/* explicit gray stack. see the tracing note in memory.c. */
 	int gray_count;
@@ -70,8 +139,35 @@ struct VM {
 void vm_init(VM *vm);
 void vm_free(VM *vm);
 
+/*
+ * Pop and return the top of the value stack, or false if it is empty.
+ *
+ * This exists for the repl. It hands out a raw Value, which the caller must
+ * treat as unrooted: any allocation before it is pushed again could collect it.
+ * The repl prints and does nothing else, which is safe. Anything more should
+ * push it straight back.
+ */
+bool vm_pop_value(VM *vm, Value *out);
+
+/* format any value the way print() does, plus a newline. for the repl. */
+void vm_print_value(Value value);
+void vm_set_diagnostics(VM *vm, FlDiagFormat format, FlColorMode color);
+
 /* compile and run. the entry point for the repl, files and modules alike. */
 InterpretResult vm_interpret(VM *vm, const char *source);
+InterpretResult vm_interpret_named(
+        VM *vm, const char *source, const char *name);
+
+/*
+ * Run a function that has already been compiled.
+ *
+ * Separate from vm_interpret_named() so that a caller which needed the
+ * ObjFunction for something else -- a bytecode dump, a verifier report, a
+ * bytecode cache -- does not have to compile it twice. The function is rooted
+ * by this caller's own frame, so it must stay alive across the call.
+ */
+InterpretResult vm_interpret_function(
+        VM *vm, ObjFunction *function, const char *source, const char *name);
 
 /*
  * Stack primitives. These are also the GC roots, so an object must be on the
