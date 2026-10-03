@@ -127,6 +127,38 @@ popping an empty list is an error, not `nil`. there is no `tryPop`.
 print(pop([]))    # error: cannot pop from an empty list
 ```
 
+## insert
+
+place a value at a position, shifting everything after it right. returns the
+item, like `push`.
+
+```flint
+let xs = [1, 2, 3]
+print(insert(xs, 1, 9))   # 9
+print(xs)                 # [1, 9, 2, 3]
+```
+
+index rules match subscript exactly: negatives count from the end, so
+`insert(xs, -1, v)` goes where `xs[-1]` reads. exactly `len(xs)` appends.
+anything else out of range, fractional, or non-numeric fails the same way
+subscript does.
+
+## remove
+
+take the value out at a position and return it. entries after it shift left.
+
+```flint
+let xs = [1, 2, 3]
+print(remove(xs, 0))   # 1
+print(xs)              # [2, 3]
+print(remove(xs, -1))  # 3
+print(xs)              # [2]
+```
+
+removing past either end, from an empty list, or through a fractional index
+is an error rather than `nil`: silently returning nothing for a removal that
+removed nothing would hide the off-by-one that caused it.
+
 the slot is not cleared, so the popped value stays reachable until the list is
 collected. that is a deliberate simplification, and it is why a large list that
 you repeatedly pop does not shrink its memory.
@@ -182,6 +214,47 @@ print([1, "two"])    # [1, "two"]
 numbers are formatted as flint formats them at the `print` statement: integral
 values have no decimal point, and everything else uses the shortest form that
 reads back as the same double. see [values.md](values.md).
+
+## num
+
+the number form of a string, and the inverse direction of `str()`. a number
+passes through, so `num` is safe to call on something that might already be
+one.
+
+```flint
+print(num("42"))       # 42
+print(num("3.14"))     # 3.14
+print(num("-0.5"))     # -0.5
+print(num("  7  "))    # 7. leading and trailing whitespace is fine.
+print(num(7))          # 7
+```
+
+the string has to parse whole. `num("12abc")` fails rather than returning 12,
+because returning a prefix would be guessing at what was meant. an empty
+string fails too, and so does anything that is neither a number nor a string.
+
+```flint
+print(num("abc"))      # error: cannot convert "abc" to a number.
+print(num(""))         # error: cannot convert an empty string to a number.
+print(num(nil))        # error: must be a number or a string, got a nil.
+```
+
+this is deliberately an error and not `nil`. a conversion that cannot be done
+is a fact about this line, and reporting it here -- naming the value -- beats
+returning nil and letting it surface three calls later as an operand error in
+code that had nothing to do with it.
+
+note that `as number` is not this. `as` is a type assertion: `"9" as number`
+fails, correctly, because a string is not a number. `num("9")` is 9.
+
+the common shape is reading from the user, since `input()` returns a string:
+
+```flint
+import math
+
+const a = num(input("a: "))
+print(math.sqrt(a))
+```
 
 ## type
 
@@ -405,6 +478,120 @@ an error.
 these are thin wrappers over `fopen`/`fread`/`fwrite`/`stat`. no buffering,
 no magic. what posix gives you is what you get.
 
+`read` and `write` stop the script with a clear error when they cannot do
+their job -- a missing source, an unwritable destination. a file that is not
+there is not an empty file, and returning nil for one would make every reader
+check for a case that is really a failure. check `exists()` first when a
+missing file is an expected outcome rather than an error.
+
+## listdir
+
+the names inside a directory, or `nil` when it cannot be read.
+
+```flint
+import fs
+
+let names = fs.listdir(".")
+if names == nil {
+    print("cannot read directory")
+    exit(1)
+}
+for name in names {
+    print(name)
+}
+```
+
+names, not paths: join them with `path.join`. `"."` and `".."` are included,
+exactly as the filesystem reports them. order is whatever the filesystem
+returns, which is to say unspecified.
+
+`nil` covers missing directories, permission failures, and the window
+between `exists()` and `listdir()` where the directory disappears. check
+`exists()` first when the reason matters; accept nil when it does not.
+
+## os
+
+platform answers, the working directory, and the environment. filesystem
+operations are `fs`, path strings are `path`, running programs is `exec()`
+or `process`: this module answers questions about the machine rather than
+changing it, with `chdir` and `setenv` as the two deliberate exceptions.
+
+```flint
+import os
+
+print(os.name() + "/" + os.arch())   # linux/x86_64, say
+print(os.getcwd())                   # where the process is standing
+print(os.getenv("HOME", ""))         # the value, or "" when unset
+print(os.pid())                      # this process's id
+```
+
+`name()` is one of `"linux"`, `"darwin"`, `"windows"`, `"freebsd"`,
+`"unknown"`. `arch()` is one of `"x86_64"`, `"aarch64"`, `"x86"`, `"arm"`,
+`"unknown"`. both answer from preprocessor macros, so they cannot be wrong
+about the binary they are compiled into -- but "unknown" is a real answer on
+a platform nobody taught them about, and a script that branches on it should
+have a fallback.
+
+`getenv(name, fallback)` takes the default explicitly, unlike `env(name)`
+which gives nil for a missing name. the result is always a string and the
+caller never branches on nil, which is what a config reader wants.
+
+`setenv` and `unsetenv` return booleans. unsetting a name that was never set
+succeeds. environment changes affect child processes, which is what makes
+them useful before `exec()` or `process.run()`.
+
+`homedir()` and `tmpdir()` give nil when the platform will not answer
+(`$HOME` unset, no `TEMP` on windows). a nil there is information -- there
+is no home to report -- not a failure.
+
+## process
+
+run a program and read what it said. the command is a list, never a string:
+a single string would have to be split somewhere, and splitting on spaces
+breaks on filenames that contain them.
+
+```flint
+import process
+
+let r = process.run(["git", "status", "--short"])
+print(r.code)      # 0
+print(r.stdout)    # the output, as a string
+```
+
+the result always has the same four fields: `stdout`, `stderr`, `code`, and
+`timed_out`. `code` follows the shell convention `exec()` already uses: the
+exit status, 128 plus the signal number for a signal death, 127 for "not
+found", 126 when exec could not run at all.
+
+```flint
+let r = process.run_opts(["ls", "/nonexistent"], {})
+print(r.code)        # 2
+print(r.timed_out)   # false
+```
+
+options are a table, and every key is optional. `cwd` runs there instead of
+here. `stdin` is piped to the child's standard input. `timeout` is
+milliseconds before the child is killed with SIGKILL:
+
+```flint
+let r = process.run_opts(["cat"], {stdin: "hello"})
+print(r.stdout)   # hello
+
+let slow = process.run_opts(["sleep", "5"], {timeout: 200})
+print(slow.timed_out)   # true
+print(slow.code)        # 137, which is 128 + 9
+```
+
+both streams are drained while the child runs, so a child that writes a lot
+to stderr while the parent reads stdout cannot deadlock -- 64K of unread
+stderr with nobody reading it is all a naive implementation takes. an
+unknown option is an error rather than ignored: an option the runtime does
+not understand is almost certainly a misspelled option it does.
+
+no shell, ever. `execvp` searches PATH and interprets nothing, so arguments
+keep their boundaries whatever they contain. a script that genuinely wants a
+shell says so explicitly with `["sh", "-c", ...]` and owns the quoting.
+
 ## collections
 
 ```flint
@@ -424,6 +611,44 @@ print(c.zip([1,2], ["a","b"])) # [[1, "a"], [2, "b"]]
 `reverse` returns a new list; the original is unchanged. `uniq` preserves
 first occurrence. `zip` stops at the shorter list. `min`, `max`, `sum` require
 a non-empty list and operate on numbers.
+
+## keys
+
+the key strings of a table, in insertion order, as a fresh list. mutating the
+result never touches the table.
+
+```flint
+let t = {b: 1, a: 2}
+print(keys(t))   # ["b", "a"]
+```
+
+## has
+
+whether the table holds the key. compares by content, so a key built at run
+time finds the entry a literal created.
+
+```flint
+let t = {ab: 1}
+print(has(t, "ab"))        # true
+print(has(t, "a" + "b"))   # true
+print(has(t, "zz"))        # false
+print(has(t, 42))          # false. only strings can be keys.
+```
+
+## delete
+
+remove an entry, reporting whether anything was removed. deleting a missing
+key is false rather than an error.
+
+```flint
+let t = {a: 1, b: 2}
+print(delete(t, "a"))   # true
+print(has(t, "a"))      # false
+print(delete(t, "a"))   # false
+```
+
+entries after the removed one shift down, preserving insertion order for
+everything that remains.
 
 ## json
 
@@ -449,3 +674,48 @@ because a function is not JSON and pretending it is makes round-trips wrong.
 circular references are not detected. the vm will overflow the call stack
 first, which is a fine outcome: a circular structure is a bug, not an edge
 case to handle gracefully.
+
+## http
+
+`import http` makes outbound request. `http.get`, `http.post`, `http.put`,
+`http.delete`, `http.request` and `http.get_json` are the entry points. they
+accept options tables: `url`, `method`, `body`, `headers` (a table),
+`timeout` in milliseconds (default 10000), and `follow` for redirects
+(default true, up to five).
+
+```flint
+import http
+
+let res = http.get("https://api.example.com/data", {headers: {"User-Agent": "flint"}})
+if res.ok {
+    print(res.body)
+} else {
+    print(res.error)
+}
+```
+
+the result is a table with:
+
+| key           | meaning                                   |
+| ------------- | ----------------------------------------- |
+| `ok`          | true only for a 2xx response             |
+| `status`      | the http status number                    |
+| `status_text` | the reason phrase                         |
+| `headers`     | response headers, a table                 |
+| `body`        | the response body as a string             |
+| `url`         | the final url after redirects             |
+| `redirects`   | how many redirects were followed          |
+| `error`       | an error message, or an empty string      |
+
+`http://` and `https://` are both supported. redirects 301/302/303 collapse
+to a GET without a body; 307/308 keep method and body. response bodies are
+returned as-is: no automatic gzip decoding.
+
+`http.get_json(url, opts)` returns `json.parse(res.body)` when the request
+succeeds, and `nil` on failure or redirect chains the server chose that no
+longer carry the body you expect.
+
+max redirects is five. a transport failure -- dns, refused, timeout -- is
+reported with `ok: false`, `status: 0`, and the error message, not a runtime
+error. an unparseable url like `ftp://...` is a runtime error.
+

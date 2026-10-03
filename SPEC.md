@@ -1,7 +1,6 @@
-# flint language spec
+# flint language specification 1.0.0
 
-version 0.5. this is the grammar and the semantics. the implementation is not
-always right; when they disagree, file a bug.
+version 1.0.0. this is the authoritative grammar and semantics specification.
 
 [docs/language.md](docs/language.md) is a prose version of this for people who
 want to read it rather than implement it. [docs/diagnostics.md](docs/diagnostics.md)
@@ -15,7 +14,7 @@ documents the current diagnostic output and its limits.
 and      as       break    const    continue else
 export   false    fn       for      if       import
 in       let      nil      not      or       print
-return   true     while
+return   true     while    try      catch    throw
 ```
 
 ### literals
@@ -51,11 +50,13 @@ declaration    = fnDecl | letDecl | constDecl | importDecl | exportDecl | statem
 letDecl        = "let" IDENTIFIER ( "=" expression )? terminator ;
 constDecl      = "const" IDENTIFIER "=" expression terminator ;
 fnDecl         = "fn" IDENTIFIER "(" parameters? ")" "{" block "}" ;
+fnExpr         = "fn" "(" parameters? ")" "{" block "}" ;
 importDecl     = "import" STRING terminator ;
 exportDecl     = "export" ( fnDecl | letDecl | constDecl ) ;
 
 statement      = exprStmt | printStmt | ifStmt | whileStmt | forStmt
-               | breakStmt | continueStmt | returnStmt | "{" block "}" ;
+               | breakStmt | continueStmt | returnStmt | tryStmt | throwStmt
+               | "{" block "}" ;
 
 printStmt      = "print" "(" arguments ")" terminator ;
 ifStmt         = "if" expression block ( "else" ( ifStmt | block ) )? ;
@@ -64,9 +65,23 @@ forStmt        = "for" IDENTIFIER "in" expression block ;
 returnStmt     = "return" expression? terminator ;
 breakStmt      = "break" terminator ;
 continueStmt   = "continue" terminator ;
+throwStmt      = "throw" expression terminator ;
+tryStmt        = "try" block "catch" ( IDENTIFIER )? block ;
 
 terminator     = ";" | newline | "}" | EOF ;
 ```
+
+A `try` block runs its body, and routes the first runtime error or `throw`ed
+value to the matching `catch` body, which binds the error to the optional
+identifier. When nothing catches the error, the script reports it and exits
+with code 70. Nested `try`s match innermost first. `break`, `continue` and
+`return` inside a `try` body retire its handler before leaving the block.
+
+An error is a table with `type` (a string naming the category) and `message`
+(a string) fields. The constructors `Error`, `TypeError`, `ValueError`,
+`IOError`, `NetworkError`, `TimeoutError`, `ProcessError`, `ModuleError` and
+`PackageError` build these tables. `throw` accepts any value, not just
+error tables.
 
 `for x in expr` iterates a list, or a range when `expr` contains `..`.
 ranges are half-open: `1..5` is 1, 2, 3, 4.
@@ -76,20 +91,26 @@ ranges are half-open: `1..5` is 1, 2, 3, 4.
 loosest to tightest:
 
 1. assignment: `=`, `+=`, `-=`, `*=`, `/=`
-2. `or`
-3. `and`
-4. equality: `==`, `!=`
-5. comparison: `<`, `<=`, `>`, `>=`
-6. range: `..`
-7. term: `+`, `-`
-8. factor: `*`, `/`, `%`
-9. type assertion: `as`
-10. unary: `!`, `not`, `-`
-11. call, subscript, field: `()`, `[]`, `.`
-12. primary: literals, identifiers, grouping, list, table
+2. nil-coalescing: `??` (right associative)
+3. `or`
+4. `and`
+5. equality: `==`, `!=`
+6. comparison: `<`, `<=`, `>`, `>=`
+7. range: `..`
+8. term: `+`, `-`
+9. factor: `*`, `/`, `%`
+10. type assertion: `as`
+11. unary: `!`, `not`, `-`
+12. call, subscript, field: `()`, `[]`, `.`
+13. primary: literals, identifiers, grouping, list, table, function literal
 
 `<=` is not `!(>)`. `NaN` is unordered, so the two forms differ on NaN and the
 compiler emits a separate opcode for each.
+
+A function literal (`fnExpr` above) is a primary expression: `fn(x) { return x }`
+evaluates to a closure, and the same rules for parameters, returns, closures and
+naming apply as for a declared function. An unnamed function reports itself as
+`<anonymous>` in a stack trace.
 
 ### type assertions
 
@@ -100,8 +121,35 @@ other name is a compile error.
 `as` asserts; it does not convert. the value is unchanged on success. on
 failure the program stops with a runtime error naming both types.
 
+`"9" as number` fails, correctly: a string is not a number. converting one is
+`num("9")`, which is 9. see `num` in the standard library.
+
 the assertion runs at run time, not at compile time, because the value may come
 from a module that has not been read yet or from a function parameter.
+
+### nil-coalescing
+
+`a ?? b` evaluates `a`. when it is not nil that is the result and `b` never
+runs. when it is nil, `b` runs and its value is the result.
+
+only nil triggers the fallback. `false`, `0`, `""`, `[]` and `{}` all stay.
+right-associative: `a ?? b ?? c` is `a ?? (b ?? c)`. binds looser than `or`
+and tighter than assignment.
+
+```flint
+let port = config["port"] ?? 8080
+```
+
+### destructuring
+
+`let {a, b} = t` binds each name from the table's fields, by the ordinary
+binding rules. flat names only: no nesting, no defaults, no renaming.
+`const` works the same way. a missing key reads nil. duplicates follow plain
+`let`: an error inside a function, an overwrite at the top level.
+
+```flint
+let {host, port} = config
+```
 
 ## semantics
 
@@ -221,6 +269,11 @@ script can pass one to another.
 | `len(x)` | bytes in a string, elements in a list. an error for anything else |
 | `push(list, item)` | append in place, returns the item |
 | `pop(list)` | remove and return the last element. an error when empty |
+| `insert(list, i, v)` | place `v` at `i`, shifting right. returns `v`. `-1` is where `xs[-1]` reads |
+| `remove(list, i)` | take out and return the element at `i`. negatives count from the end |
+| `keys(t)` | key strings in insertion order, as a fresh list |
+| `has(t, k)` | whether the table holds the key, by content |
+| `delete(t, k)` | remove the key, true when something was removed |
 | `str(val)` | string form of a scalar. containers give `<object>` |
 | `type(val)` | one of the seven type names |
 | `input([prompt])` | one line from stdin, `nil` at end of file |
@@ -287,12 +340,57 @@ and a file whose size is an exact power of two is read without a one-byte
 overflow. `write_file` treats a failed `fclose` as a failure, because a close
 that fails after a successful write means the data may not have landed.
 
-## modules, v0.3
+## modules
+
+every module has its own namespace. `import` binds one name to the module's
+exports, and nothing else about the module is reachable.
+
+### binding
+
+| written | binds | accessed as |
+|---|---|---|
+| `import math` | `math` | `math.floor(1.7)` |
+| `import "lib/geometry.fl"` | `geometry` | `geometry.area(2)` |
+| `import "a/b/c.fl"` | `c` | `c.name` |
+| `import "util.fl" as u` | `u` | `u.helper()` |
+
+the default binding is the last path component with the extension removed.
+`as` overrides it.
+
+a bare name with no quotes and no `/` is a standard library module. the search
+order is `$FLINT_STDLIB`, then `<exe-dir>/lib`, then `~/.flint/stdlib`.
+
+### exports
+
+a top-level `let`, `const` or `fn` is private to its module unless marked
+`export`. a module cannot read its importer's names, and an importer cannot
+read a module's private names.
+
+```flint
+# shapes.fl
+let tax = 0.2
+export fn taxed(amount) { return amount * (1 + tax) }
+```
+
+```flint
+import "shapes"
+print(shapes.taxed(10))   # 12
+print(shapes.tax)         # nil
+```
+
+reading a name a table does not have gives `nil`, as it does for any table.
+that is how a private name is indistinguishable from a typo, which is the
+intended behaviour: it is not there.
+
+`export` applies to `fn`, `let` and `const`. anything else after it is a
+syntax error.
+
+### resolution
 
 `import` resolves a relative path against the directory of the *importing
-file*, not the process working directory. a module path is part of the
-source, so it means the same thing no matter where the user is standing. an
-absolute path is used as given.
+file*, not the process working directory. a module path is part of the source,
+so it means the same thing no matter where the user is standing. an absolute
+path is used as given.
 
 ```
 project/
@@ -306,20 +404,48 @@ any directory. a module in `lib/` importing `"helpers.fl"` finds
 `project/lib/helpers.fl`. this is the difference between a script that works
 and a script that works only from one place.
 
-a module runs once per VM. importing it again is a no-op, so a library's
-top-level side effects happen once however many files pull it in, and a
-repeated import of a module that exports a `const` is not a redeclaration of
-it. the cache is keyed by resolved path, interned.
+with `-e` or stdin there is no source file, so a relative path resolves
+against the working directory.
 
-a file that imports itself, or two files that import each other, is an
-error naming the file already in flight:
+there is no search path for quoted imports and no symlink canonicalisation.
+two spellings of one file load it twice.
+
+### repeated imports
+
+a module runs once per VM. importing it again is a lookup, not a second run,
+and both callers receive the same table. a library's top-level side effects
+happen once however many files pull it in, and a repeated import of a module
+that exports a `const` is not a redeclaration of it. the cache is keyed by
+resolved path, interned.
+
+### cycles
+
+a file that imports itself, or two files that import each other, is an error
+naming the file already in flight:
 
 ```
 error[E0501]: Import cycle: 'cyc.fl' is already being loaded.
 ```
 
-a failed import is not cached. a missing file or a module that throws can be
-retried, and the retry is a real attempt rather than a cycle report.
+nothing partial runs. the module in flight never finishes.
+
+### failure
+
+a failed import binds nothing anywhere. a module that throws at its top level
+has not defined anything the importer can see, so a later `print(good)` is an
+undefined variable rather than a partially-initialised module.
+
+a failed module is remembered as failed. a later import of the same path
+reports that rather than retrying a failure nothing has changed:
+
+```
+error[E0501]: Module 'broken.fl' failed to load earlier in this run.
+```
+
+a failure inside a module is delivered to the importing script's handlers:
+`try { import "broken.fl" } catch err { ... }` catches the module's error. an
+error that reaches the top level is reported against the file that raised it,
+not the file that imported it.
 
 ## diagnostics, v0.3
 

@@ -41,6 +41,7 @@
 typedef enum {
 	PREC_NONE,
 	PREC_ASSIGNMENT,
+	PREC_COALESCE,
 	PREC_OR,
 	PREC_AND,
 	PREC_EQUALITY,
@@ -109,6 +110,15 @@ typedef struct Compiler {
 	CompilerUpvalue upvalues[MAX_UPVALUES];
 
 	int scope_depth;
+
+	/*
+	 * How many try blocks are open in the function this compiler is
+	 * building. Each one emitted an OP_TRY/OP_POP_HANDLER pair, and
+	 * break/continue/return crossing one has to retire its handler
+	 * first, because the handler stack is dynamic while those jumps
+	 * are static.
+	 */
+	int try_depth;
 } Compiler;
 
 /*
@@ -125,6 +135,7 @@ typedef struct LoopContext {
 	int break_count;
 	int continue_jumps[256];
 	int continue_count;
+	int try_depth; /* try blocks open when this loop began */
 } LoopContext;
 
 /* how many diagnostics before we stop and summarise instead. a file with
@@ -169,6 +180,12 @@ typedef struct {
 	 * expression_statement() */
 	bool echo_repl_value;
 	bool left_value_on_stack;
+
+	/* how many try bodies this compile is inside. An import inside a
+	 * try may legitimately end up unused: the module can throw before
+	 * the binding is ever read, and reporting that as a dead import
+	 * would be wrong. */
+	int try_nesting;
 } CompilerState;
 
 static CompilerState state;
@@ -179,6 +196,54 @@ static const char *diag_text;
 static const char *diag_name;
 static FlDiagSuggestion fixes[64];
 static size_t fix_count;
+
+/*
+ * True while compiling the declaration after an `export` keyword.
+ *
+ * File-scope like the parser state, for the same reason: it describes the
+ * declaration being parsed, and there is exactly one declaration in flight.
+ */
+static bool exporting;
+
+/* declared here because named_variable marks imports used long before the
+ * definitions below. see import_mark_used for what it does. */
+static void import_mark_used(const char *name, int length);
+
+/*
+ * Imports bound by this compilation, for the unused-import check.
+ *
+ * An import that is never read is dead code with a side effect -- it still
+ * runs the module -- and dead code that runs things is the kind that
+ * surprises people. So an import whose name is never referenced is a compile
+ * error, not a warning: warnings are easy to ignore and this one is cheap to
+ * fix, either by using the import or by deleting it.
+ *
+ * File-static like `fixes` above, reset at the start of every compile. The
+ * names are malloc'd copies because the binding for a quoted import is
+ * derived into a stack buffer that dies with import_declaration; comparing
+ * raw bytes would read freed memory.
+ *
+ * `_` as an alias opts out explicitly, for the one legitimate case: importing
+ * a module for its failure. A test that imports a module it knows will throw,
+ * to check that the importer survives, cannot use the binding -- there is
+ * nothing to use -- so it says so.
+ */
+typedef struct {
+	char *name;
+	int length;
+	int line;
+	uint32_t offset;
+	bool used;
+	/* inside a try body: the binding may legitimately go unused
+	 * because the module threw before it could be used */
+	bool in_try;
+} ImportEntry;
+
+#define FL_MAX_IMPORTS 64
+
+static ImportEntry imports[FL_MAX_IMPORTS];
+static size_t import_count;
+static bool imports_full;
 
 size_t compiler_fix_count(void) { return fix_count; }
 
@@ -556,6 +621,7 @@ static void init_compiler(Compiler *compiler, FunctionType type)
 	compiler->type = type;
 	compiler->local_count = 0;
 	compiler->scope_depth = 0;
+	compiler->try_depth = 0;
 	compiler->function = new_function(state.vm);
 	state.current = compiler;
 
@@ -588,7 +654,7 @@ static ObjFunction *end_compiler(void)
 	if (!state.parser.had_error) {
 		chunk_disassemble(current_chunk(),
 		        function->name != NULL ? function->name->chars
-		                               : "<script>");
+			                       : "<script>");
 	}
 #endif
 
@@ -628,6 +694,20 @@ static int identifier_constant(Token *name)
 {
 	return make_constant(
 	        STR_VAL(copy_string(state.vm, name->start, name->length)));
+}
+
+/*
+ * The same, for a name the parser has no token for.
+ *
+ * An import's binding name is sometimes computed rather than read -- the last
+ * path component of "lib/geometry.fl" is "geometry", and there is no token for
+ * it. This exists so that computed name can go through the same interning as
+ * every other identifier, which is what makes field access on it a pointer
+ * compare like any other.
+ */
+static int identifier_constant_from(const char *text, int length)
+{
+	return make_constant(STR_VAL(copy_string(state.vm, text, length)));
 }
 
 static bool identifiers_equal(Token *a, Token *b)
@@ -855,6 +935,25 @@ static void define_variable(int global, bool is_const)
 		return;
 	}
 
+	/*
+	 * `export let x` at the top level. The flag rides along in the opcode's
+	 * spare operand byte rather than in a second opcode, because the
+	 * ordinary case -- an unexported global -- must not grow to serve a
+	 * case most modules do not use.
+	 */
+	if (exporting) {
+		if (is_const) {
+			emit_indexed(OP_DEFINE_GLOBAL_CONST_EXPORT,
+			        OP_DEFINE_GLOBAL_CONST_EXPORT_LONG,
+			        global);
+		} else {
+			emit_indexed(OP_DEFINE_GLOBAL_EXPORT,
+			        OP_DEFINE_GLOBAL_EXPORT_LONG,
+			        global);
+		}
+		return;
+	}
+
 	if (is_const) {
 		/* a separate opcode rather than a third operand byte, so the
 		 * encoding of the common `let` does not grow to pay for a
@@ -874,6 +973,9 @@ static void define_variable(int global, bool is_const)
 static void expression(void);
 static void statement(void);
 static void declaration(void);
+static void let_destructure(bool is_const);
+static void fn_declaration(void);
+static void anonymous_function(bool can_assign);
 static void block(void);
 static ParseRule *get_rule(TokenType type);
 static void parse_precedence(Precedence precedence);
@@ -1035,6 +1137,14 @@ static void named_variable(Token name, bool can_assign)
 		arg = identifier_constant(&name);
 		get_op = OP_GET_GLOBAL;
 		set_op = OP_SET_GLOBAL;
+		/*
+		 * A global read is a use of whatever binding it resolves to,
+		 * imports included. Locals and upvalues resolve first above,
+		 * so reaching here means the name really is global -- a local
+		 * shadowing an import does not mark it used, which is correct:
+		 * the import is still dead.
+		 */
+		import_mark_used(name.start, name.length);
 	}
 
 	if (can_assign && match(TOKEN_EQUAL)) {
@@ -1195,6 +1305,31 @@ static void or_(bool can_assign)
 	parse_precedence(PREC_OR);
 	patch_jump(end_jump);
 }
+/*
+ * `a ?? b`: b when a is nil, a otherwise, with b evaluated only if needed.
+ *
+ * One jump, not two. The value is already on top of the stack: if it is not
+ * nil, jump past the fallback and keep it; if it is nil, fall through, pop
+ * it, and evaluate the right side in its place. Either path leaves exactly
+ * one value, which is what makes this compose: `a ?? b ?? c` nests without
+ * stack bookkeeping.
+ *
+ * Right-associative, like assignment: the right side parses at the same
+ * level, so `a ?? b ?? c` is `a ?? (b ?? c)`. Left would evaluate the middle
+ * before knowing whether the left needs it, which defeats the short circuit
+ * this exists for.
+ *
+ * Only nil triggers the fallback. False, 0 and "" are all values that stay,
+ * which is the entire difference from `or` and the reason both exist.
+ */
+static void coalesce(bool can_assign)
+{
+	(void)can_assign;
+	int end_jump = emit_jump(OP_JUMP_IF_NOT_NIL);
+	emit_byte(OP_POP);
+	parse_precedence(PREC_COALESCE);
+	patch_jump(end_jump);
+}
 
 /*
  * `expr as T` -- a checked type assertion.
@@ -1288,7 +1423,17 @@ static void list_literal(bool can_assign)
 		do {
 			expression();
 			count++;
-		} while (match(TOKEN_COMMA));
+			/*
+			 * A trailing comma is allowed: `[1, 2,]` is a
+			 * two-element list. A literal written across
+			 * lines almost always ends in a comma, and
+			 * rejecting that made the shape people actually
+			 * type the one shape that did not parse. The
+			 * `]` is what ends the list either way, so the
+			 * loop condition is the comma *and* not the
+			 * closer.
+			 */
+		} while (match(TOKEN_COMMA) && !check(TOKEN_RIGHT_BRACKET));
 	}
 	consume(TOKEN_RIGHT_BRACKET, "expect ']' after list.");
 	if (count > 255)
@@ -1363,7 +1508,9 @@ static void table_literal(bool can_assign)
 			expression();
 			emit_indexed(
 			        OP_SET_FIELD_TOP, OP_SET_FIELD_TOP_LONG, name);
-		} while (match(TOKEN_COMMA));
+			/* trailing comma, for the same reason as a list:
+			 * see list_literal() */
+		} while (match(TOKEN_COMMA) && !check(TOKEN_RIGHT_BRACE));
 	}
 	consume(TOKEN_RIGHT_BRACE, "expect '}' after table literal.");
 }
@@ -1417,7 +1564,7 @@ static ParseRule rules[] = {
         [TOKEN_ELSE] = {NULL, NULL, PREC_NONE},
         [TOKEN_EXPORT] = {NULL, NULL, PREC_NONE},
         [TOKEN_FALSE] = {literal, NULL, PREC_NONE},
-        [TOKEN_FN] = {NULL, NULL, PREC_NONE},
+        [TOKEN_FN] = {anonymous_function, NULL, PREC_NONE},
         [TOKEN_FOR] = {NULL, NULL, PREC_NONE},
         [TOKEN_IF] = {NULL, NULL, PREC_NONE},
         [TOKEN_IMPORT] = {NULL, NULL, PREC_NONE},
@@ -1426,6 +1573,7 @@ static ParseRule rules[] = {
         [TOKEN_NIL] = {literal, NULL, PREC_NONE},
         [TOKEN_NOT] = {unary, NULL, PREC_NONE},
         [TOKEN_OR] = {NULL, or_, PREC_OR},
+        [TOKEN_QUESTION_QUESTION] = {NULL, coalesce, PREC_COALESCE},
         [TOKEN_PRINT] = {NULL, NULL, PREC_NONE},
         [TOKEN_RETURN] = {NULL, NULL, PREC_NONE},
         [TOKEN_TRUE] = {literal, NULL, PREC_NONE},
@@ -1481,6 +1629,60 @@ static void emit_close_upvalues_to(int depth)
 		else
 			emit_byte(OP_POP);
 	}
+}
+
+/*
+ * try { ... } catch err { ... }
+ *
+ * OP_TRY pushes a handler and the catch block doubles as the jump target
+ * for errors. OP_POP_HANDLER retires the handler when the body completes
+ * normally. The catch clause binds the error value as an ordinary local:
+ * when the VM unwinds to the handler it pushes the error value at exactly
+ * the stack depth the try block began, which is where the catch body's
+ * first local belongs. No binding, and an OP_POP discards it instead.
+ */
+static void try_statement(void)
+{
+	consume(TOKEN_LEFT_BRACE, "expect '{' after try.");
+
+	int jump = emit_jump(OP_TRY);
+	state.current->try_depth++;
+	state.try_nesting++;
+	begin_scope();
+	block();
+	state.try_nesting--;
+	end_scope();
+	state.current->try_depth--;
+	emit_byte(OP_POP_HANDLER);
+	int skip = emit_jump(OP_JUMP);
+
+	patch_jump(jump);
+
+	if (!match(TOKEN_CATCH)) {
+		error("expect 'catch' after try block.");
+		return;
+	}
+	begin_scope();
+	bool have_binding = match(TOKEN_IDENTIFIER);
+	Token name = state.parser.previous;
+	if (!have_binding)
+		emit_byte(OP_POP);
+	else {
+		add_local(name, false);
+		mark_initialized();
+	}
+	consume(TOKEN_LEFT_BRACE, "expect '{' after catch.");
+	block();
+	end_scope();
+	patch_jump(skip);
+}
+
+/* throw expr: raise the value to the innermost handler, or the top. */
+static void throw_statement(void)
+{
+	expression();
+	emit_byte(OP_THROW);
+	consume_terminator();
 }
 
 static void print_statement(void)
@@ -1543,6 +1745,7 @@ static void while_statement(void)
 {
 	LoopContext loop;
 	loop.enclosing = state.loop;
+	loop.try_depth = state.current->try_depth;
 	loop.scope_depth = state.current->scope_depth;
 	loop.start = current_chunk()->count;
 	loop.continue_target = loop.start; /* re-test the condition */
@@ -1587,6 +1790,23 @@ static void for_statement(void)
 
 	consume(TOKEN_IDENTIFIER, "expect variable name after 'for'.");
 	Token var_name = state.parser.previous;
+
+	/*
+	 * `for k, v in table` iterates entries. The comma is what selects
+	 * table iteration rather than list iteration: a single variable
+	 * ranges, lists and strings, and two variables always mean table
+	 * pairs. That keeps one `for` with two shapes instead of two loops,
+	 * and it means the compiler never has to guess a container's type --
+	 * the syntax already said.
+	 */
+	bool pair_mode = false;
+	Token val_name = var_name;
+	if (match(TOKEN_COMMA)) {
+		consume(TOKEN_IDENTIFIER,
+		        "expect value name after ',' in for loop.");
+		val_name = state.parser.previous;
+		pair_mode = true;
+	}
 	consume(TOKEN_IN, "expect 'in' after for variable.");
 
 	/*
@@ -1602,11 +1822,36 @@ static void for_statement(void)
 
 		/* a range if a ".." followed the first expression */
 		if (match(TOKEN_DOT_DOT)) {
-			/* stack: [start] then [start][end] */
+			/*
+			 * A pair loop over a range is meaningless -- ranges
+			 * yield one value per step, and there is no key to
+			 * pair it with. Say so here rather than emitting a
+			 * loop that misbehaves.
+			 */
+			if (pair_mode) {
+				error("cannot iterate a range with two "
+				      "variables; ranges yield one value.");
+				return;
+			}
+			/* stack: [start] then [start][end], then
+			 * [start][end][step] when a step was written */
 			expression();
 
-			/* the user's variable takes the start slot, and a
-			 * hidden local takes the end. */
+			/*
+			 * `a..b..s` steps the range. The step defaults to 1
+			 * and its sign decides both the comparison and the
+			 * direction, so the loop below branches on the sign
+			 * rather than being compiled twice: a step is usually a
+			 * literal, but it can be a variable, and two copies
+			 * of this loop would have to agree about everything
+			 * else.
+			 */
+			bool has_step = match(TOKEN_DOT_DOT);
+			if (has_step)
+				expression();
+
+			/* the user's variable takes the start slot, and hidden
+			 * locals take the end and the step. */
 			add_local(var_name, false);
 			mark_initialized();
 			Token hidden = {TOKEN_IDENTIFIER,
@@ -1618,8 +1863,22 @@ static void for_statement(void)
 			add_local(hidden, false);
 			mark_initialized();
 
+			/* the step is on the stack only when it was written;
+			 * otherwise the constant one goes here. */
+			if (!has_step)
+				emit_constant(NUMBER_VAL(1));
+			Token hidden_step = {TOKEN_IDENTIFIER,
+			        " step",
+			        5,
+			        var_name.line,
+			        false,
+			        var_name.offset};
+			add_local(hidden_step, false);
+			mark_initialized();
+
 			LoopContext loop;
 			loop.enclosing = state.loop;
+			loop.try_depth = state.current->try_depth;
 			loop.scope_depth = state.current->scope_depth;
 			loop.start = current_chunk()->count;
 			/* the increment is emitted below, so no single offset
@@ -1629,16 +1888,63 @@ static void for_statement(void)
 			loop.continue_count = 0;
 			state.loop = &loop;
 
-			int var_slot = state.current->local_count - 2;
-			int end_slot = state.current->local_count - 1;
+			int var_slot = state.current->local_count - 3;
+			int end_slot = state.current->local_count - 2;
+			int step_slot = state.current->local_count - 1;
 
-			/* condition: var < end */
+			if (has_step) {
+				/* a zero step never reaches the end, so
+				 * it is refused before the loop rather
+				 * than hanging the program inside it. */
+				emit_bytes(OP_GET_LOCAL, (uint8_t)step_slot);
+				emit_constant(NUMBER_VAL(0));
+				emit_byte(OP_EQUAL);
+				int ok = emit_jump(OP_JUMP_IF_FALSE);
+				emit_byte(OP_POP);
+				ObjString *err_str = copy_string(state.vm,
+				        "a range step cannot be zero.",
+				        28);
+				emit_constant(STR_VAL(err_str));
+				emit_byte(OP_THROW);
+				patch_jump(ok);
+				emit_byte(OP_POP);
+			}
+
+			/*
+			 * condition: step >= 0 ? var < end : var > end
+			 *
+			 * step < 0 means descending (var > end), otherwise
+			 * ascending (var < end). The check is per-iteration
+			 * because step can be a variable.
+			 */
+			emit_bytes(OP_GET_LOCAL, (uint8_t)step_slot);
+			emit_constant(NUMBER_VAL(0));
+			emit_byte(OP_LESS);
+
+			int descending = emit_jump(OP_JUMP_IF_FALSE);
+			emit_byte(OP_POP);
+
+			/* step < 0 -> descending: check var > end */
+			emit_bytes(OP_GET_LOCAL, (uint8_t)var_slot);
+			emit_bytes(OP_GET_LOCAL, (uint8_t)end_slot);
+			emit_byte(OP_GREATER);
+			int descending_exit =
+			        emit_jump(OP_JUMP_IF_FALSE);
+			emit_byte(OP_POP);
+			int to_body = emit_jump(OP_JUMP);
+
+			patch_jump(descending);
+			emit_byte(OP_POP);
+
+			/* step >= 0 -> ascending: check var < end */
 			emit_bytes(OP_GET_LOCAL, (uint8_t)var_slot);
 			emit_bytes(OP_GET_LOCAL, (uint8_t)end_slot);
 			emit_byte(OP_LESS);
-
-			int exit_jump = emit_jump(OP_JUMP_IF_FALSE);
+			int ascending_exit =
+			        emit_jump(OP_JUMP_IF_FALSE);
 			emit_byte(OP_POP);
+
+			patch_jump(to_body);
 
 			consume(TOKEN_LEFT_BRACE,
 			        "expect '{' after for range.");
@@ -1649,11 +1955,120 @@ static void for_statement(void)
 			for (int i = 0; i < loop.continue_count; i++)
 				patch_jump(loop.continue_jumps[i]);
 
-			/* increment: var = var + 1 */
+			/* increment: var = var + step */
 			emit_bytes(OP_GET_LOCAL, (uint8_t)var_slot);
-			emit_constant(NUMBER_VAL(1));
+			emit_bytes(OP_GET_LOCAL, (uint8_t)step_slot);
 			emit_byte(OP_ADD);
 			emit_bytes(OP_SET_LOCAL, (uint8_t)var_slot);
+			emit_byte(OP_POP);
+
+			emit_loop(loop.start);
+			patch_jump(ascending_exit);
+			patch_jump(descending_exit);
+			emit_byte(OP_POP);
+
+			for (int i = 0; i < loop.break_count; i++)
+				patch_jump(loop.break_jumps[i]);
+
+			state.loop = loop.enclosing;
+			end_scope();
+			return;
+		}
+
+		/*
+		 * Table iteration. The table expression is already on the
+		 * stack, exactly as with lists, and the shape below mirrors
+		 * the list loop on purpose: hidden table, hidden index, two
+		 * user variables filled per iteration. Reading the two side by
+		 * side should show the same loop with different loads.
+		 *
+		 * The count is re-read every iteration through OP_TABLE_COUNT,
+		 * so entries appended in the body are visited. Entries removed
+		 * shift everything after them down by position, which the
+		 * documentation states plainly rather than preventing: a loop
+		 * that mutates its own table is the author's responsibility,
+		 * and the behaviour is positional rather than surprising.
+		 */
+		if (pair_mode) {
+			Token hidden_table = {TOKEN_IDENTIFIER,
+			        " table",
+			        6,
+			        var_name.line,
+			        false,
+			        var_name.offset};
+			add_local(hidden_table, false);
+			mark_initialized();
+
+			emit_constant(NUMBER_VAL(0));
+			Token hidden_tidx = {TOKEN_IDENTIFIER,
+			        " tidx",
+			        5,
+			        var_name.line,
+			        false,
+			        var_name.offset};
+			add_local(hidden_tidx, false);
+			mark_initialized();
+
+			/* key and value both start nil, filled per iteration */
+			emit_byte(OP_NIL);
+			add_local(var_name, false);
+			mark_initialized();
+			emit_byte(OP_NIL);
+			add_local(val_name, false);
+			mark_initialized();
+
+			int table_slot = state.current->local_count - 4;
+			int tidx_slot = state.current->local_count - 3;
+			int key_slot = state.current->local_count - 2;
+			int val_slot = state.current->local_count - 1;
+
+			LoopContext loop;
+			loop.enclosing = state.loop;
+			loop.try_depth = state.current->try_depth;
+			loop.scope_depth = state.current->scope_depth;
+			loop.start = current_chunk()->count;
+			loop.continue_target = -1;
+			loop.break_count = 0;
+			loop.continue_count = 0;
+			state.loop = &loop;
+
+			/* condition: idx < table_count(table) */
+			emit_bytes(OP_GET_LOCAL, (uint8_t)tidx_slot);
+			emit_bytes(OP_GET_LOCAL, (uint8_t)table_slot);
+			emit_byte(OP_TABLE_COUNT);
+			emit_byte(OP_LESS);
+
+			int exit_jump = emit_jump(OP_JUMP_IF_FALSE);
+			emit_byte(OP_POP);
+
+			/* key = table_key(table, idx) */
+			emit_bytes(OP_GET_LOCAL, (uint8_t)table_slot);
+			emit_bytes(OP_GET_LOCAL, (uint8_t)tidx_slot);
+			emit_byte(OP_TABLE_KEY);
+			emit_bytes(OP_SET_LOCAL, (uint8_t)key_slot);
+			emit_byte(OP_POP);
+
+			/* value = table_value(table, idx) */
+			emit_bytes(OP_GET_LOCAL, (uint8_t)table_slot);
+			emit_bytes(OP_GET_LOCAL, (uint8_t)tidx_slot);
+			emit_byte(OP_TABLE_VALUE);
+			emit_bytes(OP_SET_LOCAL, (uint8_t)val_slot);
+			emit_byte(OP_POP);
+
+			consume(TOKEN_LEFT_BRACE,
+			        "expect '{' after for-in expression.");
+			begin_scope();
+			block();
+			end_scope();
+
+			for (int i = 0; i < loop.continue_count; i++)
+				patch_jump(loop.continue_jumps[i]);
+
+			/* idx = idx + 1 */
+			emit_bytes(OP_GET_LOCAL, (uint8_t)tidx_slot);
+			emit_constant(NUMBER_VAL(1));
+			emit_byte(OP_ADD);
+			emit_bytes(OP_SET_LOCAL, (uint8_t)tidx_slot);
 			emit_byte(OP_POP);
 
 			emit_loop(loop.start);
@@ -1702,6 +2117,7 @@ static void for_statement(void)
 
 		LoopContext loop;
 		loop.enclosing = state.loop;
+		loop.try_depth = state.current->try_depth;
 		loop.scope_depth = state.current->scope_depth;
 		loop.start = current_chunk()->count;
 		loop.continue_target = -1;
@@ -1773,6 +2189,15 @@ static void break_statement(void)
 
 	emit_close_upvalues_to(state.loop->scope_depth);
 
+	/*
+	 * break jumps to the loop's end, so every try block opened
+	 * inside the loop since it began has to retire its handler.
+	 * Exactly the trys lexically between this break and the loop.
+	 */
+	for (int i = state.current->try_depth - state.loop->try_depth; i > 0;
+	        i--)
+		emit_byte(OP_POP_HANDLER);
+
 	/* the offsets are patched once the loop body is complete */
 	if (state.loop->break_count >= 256) {
 		error("too many break statements in loop.");
@@ -1796,6 +2221,12 @@ static void continue_statement(void)
 	}
 
 	emit_close_upvalues_to(state.loop->scope_depth);
+
+	/* retire the handlers of trys between here and the loop head */
+	for (int i = state.current->try_depth - state.loop->try_depth; i > 0;
+	        i--)
+		emit_byte(OP_POP_HANDLER);
+
 	if (state.loop->continue_target == -1) {
 		if (state.loop->continue_count >= 256) {
 			error("too many continue statements in loop.");
@@ -1815,12 +2246,22 @@ static void return_statement(void)
 	if (state.current->type == TYPE_SCRIPT)
 		error("can't return from top-level code.");
 
-	/* `return` with nothing after it is return nil */
+	/*
+	 * The return value is computed first, then the handlers are
+	 * retired. The other order looks equivalent and is not: an error
+	 * raised while computing the value has to reach a handler in this
+	 * function, and a handler already popped is a handler that is
+	 * gone. `try { return [][1] } catch e {}` has to catch.
+	 */
 	if (check(TOKEN_SEMICOLON) || check(TOKEN_RIGHT_BRACE) ||
 	        state.parser.current.newline_before || check(TOKEN_EOF)) {
+		for (int i = 0; i < state.current->try_depth; i++)
+			emit_byte(OP_POP_HANDLER);
 		emit_return();
 	} else {
 		expression();
+		for (int i = 0; i < state.current->try_depth; i++)
+			emit_byte(OP_POP_HANDLER);
 		emit_byte(OP_RETURN);
 	}
 	consume_terminator();
@@ -1873,6 +2314,10 @@ static void statement(void)
 		continue_statement();
 	} else if (match(TOKEN_RETURN)) {
 		return_statement();
+	} else if (match(TOKEN_TRY)) {
+		try_statement();
+	} else if (match(TOKEN_THROW)) {
+		throw_statement();
 	} else if (match(TOKEN_LEFT_BRACE)) {
 		/* a bare block is a scope */
 		begin_scope();
@@ -1897,13 +2342,19 @@ static void statement(void)
  * captured variable: 1 for a local slot in this frame, 0 for an upvalue of
  * this closure. That is exactly what resolve_upvalue() recorded.
  */
-static void fn_declaration(void)
+/*
+ * The parameter list and body of a function, for both spellings:
+ * `fn name(a, b) { ... }` and the anonymous expression `fn(a, b) { ... }`.
+ *
+ * The compiler is on the stack when this returns, and the caller's
+ * `end_compiler()` pops it. `compiler` is where the upvalue descriptors
+ * land, and the caller emits them right after OP_CLOSURE.
+ */
+static void fn_signature(Compiler *compiler, Token name)
 {
-	int global = parse_variable("expect function name.", false);
-	mark_initialized();
-
-	Compiler compiler;
-	init_compiler(&compiler, TYPE_FUNCTION);
+	init_compiler(compiler, TYPE_FUNCTION);
+	compiler->function->name =
+	        copy_string(state.vm, name.start, name.length);
 	begin_scope();
 
 	consume(TOKEN_LEFT_PAREN, "expect '(' after function name.");
@@ -1922,6 +2373,17 @@ static void fn_declaration(void)
 	consume(TOKEN_RIGHT_PAREN, "expect ')' after parameters.");
 	consume(TOKEN_LEFT_BRACE, "expect '{' before function body.");
 	block();
+}
+
+static void fn_declaration(void)
+{
+	int global = parse_variable("expect function name.", false);
+	mark_initialized();
+
+	Compiler compiler;
+	/* the name token the function was declared with, for the trace */
+	Token name = state.parser.previous;
+	fn_signature(&compiler, name);
 
 	ObjFunction *function = end_compiler();
 	int constant = make_constant(OBJ_VAL(function));
@@ -1936,9 +2398,50 @@ static void fn_declaration(void)
 	define_variable(global, false);
 }
 
+/*
+ * fn(a, b) { ... } as an expression, so a function can be a value:
+ * passed to another function, returned from one, or stored in a list.
+ *
+ * The value is the closure itself, on the stack, exactly where an
+ * expression is expected. `<anonymous>` is the name a stack trace shows:
+ * there is no name in the source to show, and an empty one would print
+ * as a bare `()`, which reads like a mistake.
+ */
+static void anonymous_function(bool can_assign)
+{
+	(void)can_assign;
+	Token anon = token_string("<anonymous>");
+
+	Compiler compiler;
+	fn_signature(&compiler, anon);
+
+	ObjFunction *function = end_compiler();
+	int constant = make_constant(OBJ_VAL(function));
+	emit_indexed(OP_CLOSURE, OP_CLOSURE_LONG, constant);
+	for (int i = 0; i < function->upvalue_count; i++) {
+		emit_byte(compiler.upvalues[i].is_local ? 1 : 0);
+		emit_byte(compiler.upvalues[i].index);
+	}
+}
+
 /* let, with or without an initializer. no initializer means nil. */
 static void let_declaration(void)
 {
+	/*
+	 * Table destructuring: `let {host, port} = config`.
+	 *
+	 * Flat names only -- no nesting, no defaults, no renaming. Each name
+	 * becomes an ordinary binding by the ordinary rules: missing keys read
+	 * nil (as with any field access), duplicates are a redeclaration
+	 * error, and const works the same way through const_declaration.
+	 * Anything fancier is a second declaration system, and this one stays
+	 * small on purpose.
+	 */
+	if (check(TOKEN_LEFT_BRACE)) {
+		let_destructure(false);
+		return;
+	}
+
 	int global = parse_variable("expect variable name.", false);
 
 	if (match(TOKEN_EQUAL))
@@ -1950,10 +2453,153 @@ static void let_declaration(void)
 	define_variable(global, false);
 }
 
+/*
+ * Shared by let and const destructuring. is_const threads through exactly
+ * as it does for a plain declaration.
+ */
+static void let_destructure(bool is_const)
+{
+	consume(TOKEN_LEFT_BRACE, "expect '{' after 'let'.");
+
+	/*
+	 * Parse the names first, into tokens, because the expression comes
+	 * after them in source order. Token is a window into the source
+	 * buffer, which outlives compilation, so storing them is safe.
+	 */
+	Token names[MAX_LOCALS];
+	int name_count = 0;
+	for (;;) {
+		consume(TOKEN_IDENTIFIER, "expect variable name in '{...}'.");
+		if (name_count >= MAX_LOCALS) {
+			error("too many names in destructuring.");
+			return;
+		}
+		names[name_count++] = state.parser.previous;
+		if (!match(TOKEN_COMMA))
+			break;
+	}
+	consume(TOKEN_RIGHT_BRACE, "expect '}' after destructured names.");
+	consume(TOKEN_EQUAL, "expect '=' after destructured names.");
+
+	/*
+	 * Locals need a value in every slot before the working code runs.
+	 *
+	 * A local slot is stack memory, and anything pushed afterwards lands
+	 * on the lowest free position -- which is a user slot if the user
+	 * slots sit above the stack top with nothing in them. for-in avoids
+	 * this by pushing a NIL per hidden slot first, and this does the
+	 * same: one NIL per name, each immediately claimed, so every slot
+	 * holds a real value below a top that only moves up from here.
+	 *
+	 * Globals need none of this: they live in a table, not on the
+	 * stack, so there is nothing to overlap.
+	 */
+	bool local = state.current->scope_depth > 0;
+	/*
+	 * Remember where the user slots start: they are declared next, in
+	 * order, so name i lives at first_slot + i. The hidden table slot
+	 * comes after them, which puts every user slot below every working
+	 * value for the rest of the statement.
+	 */
+	int first_slot = state.current->local_count;
+	if (local) {
+		for (int i = 0; i < name_count; i++) {
+			emit_byte(OP_NIL);
+			state.parser.previous = names[i];
+			declare_variable(is_const);
+			mark_initialized();
+		}
+	}
+
+	expression();
+	consume_terminator();
+
+	/*
+	 * The table now sits on top of the stack, so it becomes a hidden
+	 * local -- the same shape for-in uses for its list. Everything after
+	 * this reads through it, and the top stays above it for the rest of
+	 * the statement, so no working value ever lands on a live slot.
+	 */
+	Token hidden = {TOKEN_IDENTIFIER,
+	        " table",
+	        6,
+	        names[0].line,
+	        false,
+	        names[0].offset};
+	add_local(hidden, false);
+	mark_initialized();
+	int table_slot = state.current->local_count - 1;
+
+	/*
+	 * One load-and-bind per name. declare_variable runs with
+	 * parser.previous temporarily set for the globals case, because it
+	 * reads the name from there; locals were already declared above.
+	 */
+	Token saved = state.parser.previous;
+	for (int i = 0; i < name_count; i++) {
+		int constant = -1;
+		int slot = -1;
+		if (!local) {
+			state.parser.previous = names[i];
+			declare_variable(is_const);
+			constant = identifier_constant(&state.parser.previous);
+		} else {
+			/*
+			 * Slots were assigned in order above, starting at
+			 * first_slot: name i lives at first_slot + i, all
+			 * below the hidden table slot. Recomputing beats
+			 * re-resolving, because resolve_local would find the
+			 * name but could not distinguish it from an outer
+			 * binding of the same spelling.
+			 */
+			slot = first_slot + i;
+		}
+
+		/* load table.field, leaving the value on top */
+		emit_bytes(OP_GET_LOCAL, (uint8_t)table_slot);
+		emit_indexed(OP_GET_FIELD,
+		        OP_GET_FIELD_LONG,
+		        identifier_constant(&names[i]));
+
+		/* bind it, by the same rules as a plain declaration */
+		if (!local) {
+			if (exporting) {
+				if (is_const) {
+					emit_indexed(
+					        OP_DEFINE_GLOBAL_CONST_EXPORT,
+					        OP_DEFINE_GLOBAL_CONST_EXPORT_LONG,
+					        constant);
+				} else {
+					emit_indexed(OP_DEFINE_GLOBAL_EXPORT,
+					        OP_DEFINE_GLOBAL_EXPORT_LONG,
+					        constant);
+				}
+			} else if (is_const) {
+				emit_indexed(OP_DEFINE_GLOBAL_CONST,
+				        OP_DEFINE_GLOBAL_CONST_LONG,
+				        constant);
+			} else {
+				emit_indexed(OP_DEFINE_GLOBAL,
+				        OP_DEFINE_GLOBAL_LONG,
+				        constant);
+			}
+		} else {
+			emit_bytes(OP_SET_LOCAL, (uint8_t)slot);
+			emit_byte(OP_POP);
+		}
+	}
+	state.parser.previous = saved;
+}
+
 /* const. the initializer is mandatory: a const with no value has nothing to
  * be constant about. */
 static void const_declaration(void)
 {
+	if (check(TOKEN_LEFT_BRACE)) {
+		let_destructure(true);
+		return;
+	}
+
 	int global = parse_variable("expect variable name.", true);
 
 	consume(TOKEN_EQUAL, "expect '=' after const name.");
@@ -2017,24 +2663,172 @@ static void synchronize(void)
  * have to be kept in agreement about what an import means. The package manager
  * will sit in front of import_file(), not beside it.
  */
+
+/*
+ * Record an import binding for the unused-import check.
+ *
+ * Called with the name about to be bound and the path token that names the
+ * file, so the eventual error can point at the import line rather than at the
+ * end of the file. A `_` alias is not recorded: it is the explicit opt-out
+ * for imports kept for their failure, and checking it would defeat the
+ * purpose of writing it.
+ */
+static void import_record(const char *name, int length, const Token *path)
+{
+	if (import_count >= FL_MAX_IMPORTS) {
+		imports_full = true;
+		return;
+	}
+	char *copy = malloc((size_t)length + 1);
+	if (copy == NULL)
+		return;
+	memcpy(copy, name, (size_t)length);
+	copy[length] = '\0';
+	imports[import_count].name = copy;
+	imports[import_count].length = length;
+	imports[import_count].line = path->line;
+	imports[import_count].offset = path->offset;
+	imports[import_count].used = false;
+	imports[import_count].in_try = state.try_nesting > 0;
+	import_count++;
+}
+
+/*
+ * Mark every import binding with this name as used.
+ *
+ * All matching entries, not just the first: importing the same module twice
+ * under one name and then using it is the documented re-import idiom, and
+ * flagging the first of the two would punish a program for doing what the
+ * manual says to do.
+ */
+static void import_mark_used(const char *name, int length)
+{
+	for (size_t i = 0; i < import_count; i++) {
+		if (imports[i].length == length &&
+		        memcmp(imports[i].name, name, (size_t)length) == 0)
+			imports[i].used = true;
+	}
+}
+
+/*
+ * Report every import that was never referenced.
+ *
+ * Runs at the end of compilation, before the result is returned, so the
+ * errors carry the import's own line rather than pointing nowhere. Skipped
+ * when the file already failed: a broken program produces enough diagnostics
+ * without one more, and an unused import in code that does not compile is
+ * the least of its problems.
+ *
+ * Skipped in the REPL, where each submission compiles separately: `import
+ * math` on one line and `math.floor(2)` on the next is the normal way to
+ * work interactively, and flagging the first line would make the REPL
+ * unusable for exactly the exploration it exists for.
+ */
+static void import_check_unused(void)
+{
+	if (state.parser.had_error || state.echo_repl_value)
+		return;
+	if (imports_full)
+		return;
+	/*
+	 * Collapse by name first: if any import of a name is used, all of
+	 * them are. Re-importing the same module under one name is
+	 * idempotent -- every binding holds the same table -- so asking
+	 * whether each individual statement's result was read would flag
+	 * re-imports that the manual explicitly blesses. What matters is
+	 * whether the module was ever touched, not which import line the
+	 * reference happens to follow in source order.
+	 */
+	for (size_t i = 0; i < import_count; i++) {
+		if (!imports[i].used)
+			continue;
+		for (size_t j = 0; j < import_count; j++) {
+			if (imports[j].length == imports[i].length &&
+			        memcmp(imports[j].name,
+			                imports[i].name,
+			                (size_t)imports[i].length) == 0)
+				imports[j].used = true;
+		}
+	}
+	for (size_t i = 0; i < import_count; i++) {
+		if (imports[i].used || imports[i].in_try)
+			continue;
+		Token at = {
+		        TOKEN_IDENTIFIER,
+		        imports[i].name,
+		        imports[i].length,
+		        imports[i].line,
+		        false,
+		        imports[i].offset,
+		};
+		char message[128];
+		snprintf(message,
+		        sizeof(message),
+		        "imported '%s' but never used. remove the import, or "
+		        "use it.",
+		        imports[i].name);
+		error_at(&at, message);
+		/*
+		 * Each unused import is an independent fact, not a cascade
+		 * from the previous one. synchronize() clears panic_mode
+		 * between declarations for the same reason; without this,
+		 * only the first of several dead imports would be reported.
+		 */
+		state.parser.panic_mode = false;
+	}
+}
+
 static void import_declaration(void)
 {
 	const char *src;
 	int len;
 	Token path_token;
+	bool quoted;
 
 	if (match(TOKEN_STRING)) {
 		path_token = state.parser.previous;
+		quoted = true;
 		/* the quotes are at both ends; the path is what is between */
 		src = path_token.start + 1;
 		len = path_token.length - 2;
 	} else if (match(TOKEN_IDENTIFIER)) {
 		path_token = state.parser.previous;
+		quoted = false;
 		src = path_token.start;
 		len = path_token.length;
 	} else {
 		error("expect a module path or a library name after 'import'.");
 		return;
+	}
+
+	/*
+	 * `import "x.fl" as name` binds the module's exports to `name`.
+	 *
+	 * Without it, the name is the last path component with the .fl
+	 * dropped, or the bare library name. That default is what every
+	 * existing script already spells, so it keeps working; `as` exists for
+	 * the cases where the derived name is wrong or unreadable --
+	 *
+	 *     import "lib/geometry/circle.fl" as geometry
+	 *     import "../shared/util.fl" as util
+	 *
+	 * or simply to say what a file is for when its filename is not that.
+	 */
+	Token alias;
+	bool has_alias = false;
+	if (match(TOKEN_AS)) {
+		alias = state.parser.previous;
+		if (match(TOKEN_IDENTIFIER)) {
+			Token name = state.parser.previous;
+			/* copy the token out; the scanner's buffer moves on */
+			alias.start = name.start;
+			alias.length = name.length;
+			alias.line = name.line;
+			alias.offset = name.offset;
+			has_alias = true;
+		} else {
+			error("expect a name after 'as'.");
+		}
 	}
 	consume_terminator();
 
@@ -2045,30 +2839,142 @@ static void import_declaration(void)
 	        false,
 	        path_token.offset};
 	int fn_const = identifier_constant(&import_fn);
-	emit_indexed(OP_GET_GLOBAL, OP_GET_GLOBAL_LONG, fn_const);
 
+	/*
+	 * Call it: [import_file][path], then OP_CALL 1.
+	 *
+	 * OP_CALL reads the callee at peek(arg_count) -- one slot *below* the
+	 * arguments -- so the callee goes under its argument, not over it.
+	 * Getting this backwards compiles cleanly and calls the path string,
+	 * which fails with "can only call functions" several frames from the
+	 * mistake.
+	 */
+	emit_indexed(OP_GET_GLOBAL, OP_GET_GLOBAL_LONG, fn_const);
 	ObjString *str = copy_string(state.vm, src, len);
 	emit_constant(STR_VAL(str));
-
 	emit_bytes(OP_CALL, 1);
-	emit_byte(OP_POP);
+
+	/*
+	 * Bind the returned table.
+	 *
+	 * This is the line that did not exist before. In v0.5.0 the result was
+	 * popped and discarded, and a library import worked because the loader
+	 * had separately poked a name into the *importer's* table -- which is
+	 * why a module could define things in its importer, and why two
+	 * modules could clobber each other's globals.
+	 *
+	 * Now the module's exports arrive as a table and are bound here, in
+	 * this module, under one name. `import geometry` then means
+	 * `geometry.area(5)` through ordinary field access.
+	 */
+	const char *bind_name;
+	int bind_len;
+	char derived[64];
+
+	if (has_alias) {
+		bind_name = alias.start;
+		bind_len = alias.length;
+	} else if (quoted) {
+		/*
+		 * "lib/geometry.fl" binds as `geometry`: the last component,
+		 * without the extension. Trailing slashes are ignored so
+		 * "lib/geometry/" is not a syntax error for a path nobody
+		 * would write on purpose.
+		 */
+		const char *start = src;
+		const char *end = src + len;
+		while (end > start && end[-1] == '/')
+			end--;
+		const char *slash = end;
+		while (slash > start && slash[-1] != '/')
+			slash--;
+		/*
+		 * Drop the extension. `stop` walks back from the end of the
+		 * component to its last '.', but only when that leaves a name
+		 * behind -- ".fl" must not reduce to nothing, and "a.b.fl" is
+		 * `a.b` rather than `a`.
+		 */
+		const char *stop = end;
+		while (stop > slash + 1 && stop[-1] != '.')
+			stop--;
+		/* back off the dot itself. the loop above stops with `stop`
+		 * one past the '.', because the test reads stop[-1] before
+		 * the decrement, so leaving it there yields "geometry." */
+		if (stop < end && stop[-1] == '.')
+			stop--;
+		size_t n = (size_t)(stop - slash);
+		if (n >= sizeof(derived))
+			n = sizeof(derived) - 1;
+		memcpy(derived, slash, n);
+		derived[n] = '\0';
+		if (n == 0) {
+			error("cannot derive a name from this import path. "
+			      "use 'as'.");
+			emit_byte(OP_POP);
+			return;
+		}
+		bind_name = derived;
+		bind_len = (int)n;
+	} else {
+		bind_name = src;
+		bind_len = len;
+	}
+
+	/*
+	 * OP_DEFINE_GLOBAL takes the name as an operand and defines whatever
+	 * is on top of the stack, which right now is the import's result
+	 * table. Nothing else needs pushing: pushing the name as well would
+	 * make it the value being defined, and `math` would be the string
+	 * "math".
+	 */
+	emit_indexed(OP_DEFINE_GLOBAL,
+	        OP_DEFINE_GLOBAL_LONG,
+	        identifier_constant_from(bind_name, bind_len));
+
+	/*
+	 * Record the binding for the unused-import check, unless it is the
+	 * explicit opt-out. `import "x.fl" as _` means "run this for its
+	 * failure" -- a test importing a module it knows will throw -- and
+	 * there is nothing to use, so checking it would defeat the purpose
+	 * of writing it.
+	 */
+	if (!(bind_len == 1 && bind_name[0] == '_'))
+		import_record(bind_name, bind_len, &path_token);
 }
 
 /*
  * export fn / let / const
  *
- * There is no module namespace. The declaration is compiled exactly as if
- * the export keyword were not there and lands in the shared globals table,
- * which is why `export` can simply parse the declaration and step aside.
+ * `export` is a flag, not a namespace. The declaration is compiled exactly as
+ * if the keyword were not there -- it lands in this module's own globals, like
+ * any other top-level name -- and the name is additionally marked so the
+ * loader will put it in the table the importer receives.
+ *
+ * That is the smallest thing that makes `export` mean something. The previous
+ * implementation parsed the declaration and stepped aside, and the "exports"
+ * were whatever the module had added to the shared global table, discovered by
+ * diffing that table across the run. Diffing cannot tell a helper from an
+ * export: both are just a name that appeared. So `export` marked intent and
+ * nothing else, and a module's private function was as visible as its public
+ * one.
+ *
+ * Marking the binding at compile time makes the distinction the module
+ * actually wrote down.
  */
 static void export_declaration(void)
 {
 	if (match(TOKEN_FN)) {
+		exporting = true;
 		fn_declaration();
+		exporting = false;
 	} else if (match(TOKEN_LET)) {
+		exporting = true;
 		let_declaration();
+		exporting = false;
 	} else if (match(TOKEN_CONST)) {
+		exporting = true;
 		const_declaration();
+		exporting = false;
 	} else {
 		error("expect 'fn', 'let', or 'const' after 'export'.");
 	}
@@ -2143,6 +3049,17 @@ ObjFunction *compile_named(VM *vm, const char *source, const char *name)
 	state.loop = NULL;
 	state.current = NULL;
 
+	/*
+	 * Nor its import list. The entries hold malloc'd names freed at the
+	 * end of the compile that recorded them; without this, a second
+	 * compilation would report the first one's imports -- or read freed
+	 * memory, if the first compile's cleanup already ran.
+	 */
+	for (size_t i = 0; i < import_count; i++)
+		free(imports[i].name);
+	import_count = 0;
+	imports_full = false;
+
 	state.vm = vm;
 	scanner_init(source);
 	diag_text = source;
@@ -2155,6 +3072,17 @@ ObjFunction *compile_named(VM *vm, const char *source, const char *name)
 
 	while (!match(TOKEN_EOF))
 		declaration();
+
+	/*
+	 * Unused imports are reported here, after every declaration has had
+	 * its chance to reference them, and before the error summary below so
+	 * the count includes them. See import_check_unused for why the REPL
+	 * is exempt.
+	 */
+	import_check_unused();
+	for (size_t i = 0; i < import_count; i++)
+		free(imports[i].name);
+	import_count = 0;
 
 	/*
 	 * The summary. One line, and only when it is not obvious: if the

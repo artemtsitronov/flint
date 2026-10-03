@@ -11,7 +11,12 @@ on:
 jobs:
   build:
     name: build and test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # Pinned rather than floating. ubuntu-latest migrates without warning --
+    # it is scheduled to become 26.04 -- and a new runner image means new
+    # preinstalled compilers, which is how a green build goes red with no
+    # code changing. Bump deliberately, after watching a full run go green
+    # on the new image.
     strategy:
       matrix:
         compiler: [gcc, clang]
@@ -23,7 +28,9 @@ jobs:
       LLVM_MAJOR: '24'
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
+      # v4 targets Node 20, which the runners now shim with a deprecation
+      # notice on every job. v5 targets the current runtime.
 
     - name: set compiler
       run: |
@@ -103,6 +110,10 @@ jobs:
         #
         # Bump it when a new major lands, and check the index first.
         sudo apt-get install -y "clang-tidy-${LLVM_MAJOR}"
+        # clang-format comes from the same major, so fmt-check and the
+        # developer's `make fmt` agree. An unpinned clang-format is how
+        # one version's output becomes another version's violation.
+        sudo apt-get install -y "clang-format-${LLVM_MAJOR}"
 
     # clang-format runs first, on its own. clang-tidy loads .clang-format for
     # every file it processes, and an unrecognised key there aborts the whole
@@ -114,7 +125,7 @@ jobs:
     # continue-on-error. Its job here is to make a mismatch visible, not to
     # gate the build.
     - name: clang-format config check
-      run: make fmt-check
+      run: make fmt-check CLANG_FORMAT=clang-format-$LLVM_MAJOR
       continue-on-error: true
 
     - name: clang-tidy
@@ -136,6 +147,12 @@ jobs:
             bad=1
           fi
         done
+        if [ "$bad" -ne 0 ]; then
+          echo
+          echo "gcc accepts these; clang rejects them under -Werror."
+          echo "the usual cause is a whole-file rewrite that did not append"
+          echo "a trailing newline: printf '\n' >> the file fixes it."
+        fi
         exit $bad
 
     - name: ccache stats

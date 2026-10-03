@@ -119,6 +119,78 @@ own storage and repoints the upvalue at that storage. the VM emits
 `OP_CLOSE_UPVALUE` for any local leaving scope that was captured. a plain
 `OP_POP` would leave the upvalue pointing at a slot that the next call reuses.
 
+## modules
+
+every module gets its own `Table` of globals. `vm->globals` is a pointer into
+a heap array of them, and the bytecode is unchanged: `OP_DEFINE_GLOBAL` means
+"whatever table is running". that is why adding isolation needed no new opcode
+in the hot path.
+
+an `ObjClosure` records the environment it was created in. without that, a
+function called after its module's import returned would resolve its names
+against whatever module happened to be running -- so `area` would read
+`display`'s `scale` instead of its own.
+
+environments are allocated and never reused. two imports at the same nesting
+depth taking the same slot is how two unrelated modules ended up reporting
+"cannot redefine constant" against each other's names.
+
+a module's environment is kept even after the module fails. it may have handed
+out a closure the importer still holds, and freeing it is a use-after-free on
+every later call. the collector decides instead.
+
+`export` is a flag on the table entry, set by `OP_DEFINE_GLOBAL_EXPORT` at
+compile time. The loader copies only flagged bindings into the table the
+importer receives. Finding exports by diffing the global table -- what v0.5.0
+did -- cannot tell a helper from a public function.
+
+## subprocesses
+
+`process.run` forks, wires two pipes plus an optional stdin pipe, and drains
+both streams with `poll()` while the child runs. reading one stream to EOF
+and then the other deadlocks as soon as the child fills the second pipe's
+buffer -- 64K of unread stderr is all it takes -- so both are drained
+together. an optional timeout kills with SIGKILL, and the result carries a
+`timed_out` flag so a timeout kill is distinguishable from a signal death.
+
+the child does nothing but `dup2`, `chdir`, `execvp` and `_exit`. forking
+before anything that can allocate or lock is what keeps the child from running
+a parent's stdio buffer or malloc lock. no shell anywhere: `execvp` searches
+PATH and interprets nothing.
+
+## http and sync
+
+`src/runtime/http.c` is an HTTP/1.1 client without a TLS stack, which is why
+it is two transports. `http://` is a native socket client built in the file
+itself -- a straight-line poll-driven send/recv loop. `https://` delegates
+to curl(1), because TLS is a dependency and the release has none. curl is
+required only when a script actually makes an https request, and nothing
+about the result differs by scheme: one parse path, one table shape.
+
+`flint sync` rides the same fork-exec-curl machinery, with one extra
+promise: a fetched module is verified by compiling it before it replaces the
+old one. A 404 or a half-downloaded file never becomes a broken library.
+
+## deferred features
+
+two designs were evaluated and deliberately not shipped.
+
+`defer` needs per-frame cleanup stacks, scope tracking, and -- hardest -- an
+error policy for a deferred action that itself fails. "run the rest anyway"
+requires per-action error isolation the unwind model does not have; "stop at
+the first failure" abandons cleanup it promised to run. either is a coherent
+choice, but either is also VM surgery on the return and unwind paths, and
+there are currently no resource handles in the language that need cleanup:
+only whole-file `read`/`write` exist, no `open`/`close`. a cleanup construct
+with nothing to clean up is scope creep with a good name. when file handles
+land, this design is the starting point.
+
+destructuring shipped instead, because it is parser work over existing
+opcodes: `let {a, b} = t` compiles to a hidden table local plus one
+load-and-bind per name, with locals pre-filled so every slot holds a value
+below a top that only moves up. no VM changes, no new opcodes, no new failure
+modes.
+
 ## bytecode verification
 
 every chunk is verified before it runs. the pass checks that each opcode is a
@@ -176,7 +248,9 @@ roots:
 - the value stack, from `vm->stack` to `vm->stack_top`
 - the closure in every live `CallFrame`
 - the open upvalue list
-- the globals table
+- every module environment, not just the running one. a module's bindings stay
+  reachable for as long as the VM lives -- a closure may hold a pointer into one
+  -- so marking only `vm->globals` would sweep a module still in use
 - every `Compiler` on the chain the compiler hands over. the four parser
   globals (`parser`, `current`, `vm`, `loop`) live in one `CompilerState`
   struct, and `compile()` saves it on entry and restores it on exit, so a

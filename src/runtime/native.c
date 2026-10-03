@@ -9,6 +9,7 @@
  * the whole thing is reentrant. import_file does exactly that.
  */
 #include "native.h"
+#include "common.h"
 #include "memory.h"
 #include "native_math.h"
 #include "object.h"
@@ -19,6 +20,7 @@
 #include "value.h"
 #include "vm.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,6 +196,170 @@ static Value pop_native(VM *vm, int argc, Value *argv)
 }
 
 /*
+ * insert(xs, i, v) -> v, with v placed at position i.
+ *
+ * Everything at i and after shifts one slot right. Negative indices count
+ * from the end, as everywhere else: insert(xs, -1, v) puts v before the
+ * last element, and insert(xs, len(xs), v) is an append. The index goes
+ * through the same whole-number validation as subscript, so a fractional
+ * index fails here exactly as it does there.
+ */
+static Value insert_native(VM *vm, int argc, Value *argv)
+{
+	(void)argc;
+	if (!IS_LIST(argv[0])) {
+		vm_runtime_error(
+		        vm, "first argument to insert() must be a list.");
+		return NIL_VAL;
+	}
+	ObjList *list = AS_LIST(argv[0]);
+	/*
+	 * One past the end is legal and means append, but negatives count
+	 * from the end of the *current* list -- insert(xs, -1, v) goes before
+	 * the last element, exactly where xs[-1] reads. Validating against
+	 * count+1 would shift every negative by one and make -1 mean append,
+	 * which contradicts indexing. So: exactly count appends, everything
+	 * else goes through the shared validation.
+	 */
+	int idx;
+	if (IS_NUMBER(argv[1]) && AS_NUMBER(argv[1]) == (double)list->count) {
+		idx = list->count;
+	} else if (!vm_value_to_index(vm, argv[1], list->count, &idx, "list")) {
+		return NIL_VAL;
+	}
+	if (list->capacity < list->count + 1) {
+		int old_cap = list->capacity;
+		list->capacity = GROW_CAPACITY(old_cap);
+		list->items = GROW_ARRAY(
+		        vm, Value, list->items, old_cap, list->capacity);
+	}
+	for (int i = list->count; i > idx; i--)
+		list->items[i] = list->items[i - 1];
+	list->items[idx] = argv[2];
+	list->count++;
+	return argv[2];
+}
+
+/*
+ * remove(xs, i) -> the removed value.
+ *
+ * Entries after i shift one slot left, preserving order for everything
+ * that remains. Negative indices count from the end. Removing from an
+ * empty list, or past either end, is an error rather than nil: silently
+ * returning nothing for a removal that removed nothing would hide the
+ * off-by-one that caused it.
+ */
+static Value remove_native(VM *vm, int argc, Value *argv)
+{
+	(void)argc;
+	(void)vm;
+	if (!IS_LIST(argv[0])) {
+		vm_runtime_error(
+		        vm, "first argument to remove() must be a list.");
+		return NIL_VAL;
+	}
+	ObjList *list = AS_LIST(argv[0]);
+	int idx;
+	if (!vm_value_to_index(vm, argv[1], list->count, &idx, "list"))
+		return NIL_VAL;
+	Value removed = list->items[idx];
+	for (int i = idx; i < list->count - 1; i++)
+		list->items[i] = list->items[i + 1];
+	list->count--;
+	return removed;
+}
+
+/*
+ * keys(t) -> list of the table's key strings, in insertion order.
+ *
+ * A fresh list every call, so mutating the result never touches the table.
+ * Insertion order is guaranteed because the table itself is insertion
+ * ordered -- parallel arrays, not a hash -- so this is a copy rather than a
+ * traversal that could surprise.
+ */
+static Value keys_native(VM *vm, int argc, Value *argv)
+{
+	(void)argc;
+	if (!IS_FLINT_TABLE(argv[0])) {
+		vm_runtime_error(vm, "argument to keys() must be a table.");
+		return NIL_VAL;
+	}
+	ObjTable *t = AS_FLINT_TABLE(argv[0]);
+	ObjList *out = new_list(vm);
+	vm_push(vm, OBJ_VAL(out));
+	if (t->count > 0) {
+		out->items = ALLOCATE(vm, Value, t->count);
+		out->capacity = t->count;
+		for (int i = 0; i < t->count; i++)
+			out->items[i] = STR_VAL(t->keys[i]);
+		out->count = t->count;
+	}
+	vm_pop(vm);
+	return OBJ_VAL(out);
+}
+
+/*
+ * has(t, k) -> whether the table holds this key.
+ *
+ * Content comparison, because a computed key is a runtime string and may
+ * never have been interned. Pointer comparison would answer "no" for a key
+ * that is plainly there, which is the same bug OP_GET_FIELD had before it
+ * was fixed. A non-string key is false rather than an error: asking about
+ * something that cannot be a key is a no, not a mistake.
+ */
+static Value has_native(VM *vm, int argc, Value *argv)
+{
+	(void)argc;
+	if (!IS_FLINT_TABLE(argv[0])) {
+		vm_runtime_error(
+		        vm, "first argument to has() must be a table.");
+		return NIL_VAL;
+	}
+	if (!IS_STRING(argv[1]))
+		return FALSE_VAL;
+	ObjTable *t = AS_FLINT_TABLE(argv[0]);
+	ObjString *key = AS_STRING(argv[1]);
+	for (int i = 0; i < t->count; i++) {
+		if (fl_strings_equal(t->keys[i], key))
+			return TRUE_VAL;
+	}
+	return FALSE_VAL;
+}
+
+/*
+ * delete(t, k) -> true when something was removed.
+ *
+ * Entries after the removed one shift down, preserving insertion order for
+ * everything that remains. Deleting a missing key is false rather than an
+ * error: "make sure this is gone" should not fail when it already is.
+ */
+static Value delete_native(VM *vm, int argc, Value *argv)
+{
+	(void)argc;
+	(void)vm;
+	if (!IS_FLINT_TABLE(argv[0])) {
+		vm_runtime_error(
+		        vm, "first argument to delete() must be a table.");
+		return NIL_VAL;
+	}
+	if (!IS_STRING(argv[1]))
+		return FALSE_VAL;
+	ObjTable *t = AS_FLINT_TABLE(argv[0]);
+	ObjString *key = AS_STRING(argv[1]);
+	for (int i = 0; i < t->count; i++) {
+		if (!fl_strings_equal(t->keys[i], key))
+			continue;
+		for (int j = i; j < t->count - 1; j++) {
+			t->keys[j] = t->keys[j + 1];
+			t->values[j] = t->values[j + 1];
+		}
+		t->count--;
+		return TRUE_VAL;
+	}
+	return FALSE_VAL;
+}
+
+/*
  * string form of any value. strings are returned as themselves, so this is
  * free in the common case. numbers reuse the integral check from print():
  * "4" not "4.000000".
@@ -231,6 +397,124 @@ static Value str_native(VM *vm, int argc, Value *argv)
 	return STR_VAL(new_string(vm, "<object>", 8));
 }
 
+/*
+ * `num(x)` -- string to number, and the inverse direction of `str()`.
+ *
+ * This exists because `input()` returns a string and there was previously
+ * no way to get a number out of one. `as number` is a type assertion, not a
+ * conversion, so `"9" as number` correctly fails -- and then the user has a
+ * string that looks like a number and no function that agrees. That gap is
+ * what this closes.
+ *
+ * Numbers pass through. Strings must parse whole: leading and trailing
+ * whitespace is tolerated because `input()` hands back whatever the user
+ * typed, and a trailing newline or space should not be the difference between
+ * working and failing. Anything else that strtod does not consume is an
+ * error, not a prefix: `num("12abc")` fails rather than returning 12, because
+ * returning a prefix would be guessing at what the user meant.
+ *
+ * Everything else is an error rather than nil. A failed conversion that
+ * silently becomes nil would surface three calls later as an operand error in
+ * code that had nothing to do with it; failing here, naming the value, is
+ * the useful behaviour.
+ */
+static Value num_native(VM *vm, int argc, Value *argv)
+{
+	(void)argc;
+	Value val = argv[0];
+	if (IS_NUMBER(val))
+		return val;
+	if (!IS_STRING(val)) {
+		vm_runtime_error(vm,
+		        "argument to num() must be a number or a string, but "
+		        "got a %s.",
+		        flint_type_name(val));
+		return NIL_VAL;
+	}
+
+	const char *text = AS_CSTRING(val);
+	int length = AS_STRING(val)->length;
+
+	/* skip leading whitespace, which strtod would skip anyway. doing it
+	 * here means the empty-string check below sees what is really there. */
+	while (length > 0 && (*text == ' ' || *text == '\t' || *text == '\n' ||
+	                             *text == '\r')) {
+		text++;
+		length--;
+	}
+	while (length > 0 &&
+	        (text[length - 1] == ' ' || text[length - 1] == '\t' ||
+	                text[length - 1] == '\n' || text[length - 1] == '\r'))
+		length--;
+
+	if (length == 0) {
+		vm_runtime_error(
+		        vm, "cannot convert an empty string to a number.");
+		return NIL_VAL;
+	}
+
+	/*
+	 * NUL-terminate a copy, because strtod needs one and the string's own
+	 * NUL sits past `length` bytes that may include more text. The copy is
+	 * malloc'd rather than on the C stack: a hostile input can be long,
+	 * and a variable-length stack array sized by user input is exactly the
+	 * shape that overflows one.
+	 */
+	char *copy = malloc((size_t)length + 1);
+	if (copy == NULL) {
+		vm_runtime_error(vm, "out of memory in num().");
+		return NIL_VAL;
+	}
+	memcpy(copy, text, (size_t)length);
+	/*
+	 * In bounds: the allocation above is `length + 1`. The analyzer flags
+	 * a negative index because nothing in this function proves length is
+	 * non-negative -- but allocate_string() asserts it for every string
+	 * that exists, so a negative length here would mean the heap object
+	 * itself is corrupt, not this index. Same reasoning as the
+	 * buffer[bytes] annotation in import_file_native below.
+	 */
+	/* NOLINTNEXTLINE(clang-analyzer-security.ArrayBound) */
+	copy[length] = '\0';
+
+	errno = 0;
+	char *end = NULL;
+	double result = strtod(copy, &end);
+	/* strtod sets end to the first character it did not use. anything
+	 * left over means the string was not a number, just something that
+	 * started like one. */
+	bool ok = end != NULL && *end == '\0' && end != copy;
+	bool overflow = ok && errno == ERANGE;
+	free(copy);
+
+	if (!ok) {
+		vm_runtime_error(vm,
+		        "cannot convert \"%s\" to a number.",
+		        AS_CSTRING(val));
+		return NIL_VAL;
+	}
+	if (overflow) {
+		vm_runtime_error(vm,
+		        "cannot convert \"%s\" to a number: out of range.",
+		        AS_CSTRING(val));
+		return NIL_VAL;
+	}
+	return NUMBER_VAL(result);
+}
+
+/* The zero-step check for `a..b..0`, raised from C so the message and the
+ * error shape come from the same place as every other runtime error. There is
+ * no compiler opcode for it: a range with a zero step would loop forever, and
+ * one call at the top of the loop is cheaper than a new opcode plus a verifier
+ * rule. */
+static Value range_step_error_native(VM *vm, int argc, Value *argv)
+{
+	(void)argc;
+	(void)argv;
+	vm_runtime_error(vm, "a range step cannot be zero.");
+	return NIL_VAL;
+}
+
 /* the type name, as a string. type() is the only way to introspect. */
 static Value type_native(VM *vm, int argc, Value *argv)
 {
@@ -248,19 +532,100 @@ static Value type_native(VM *vm, int argc, Value *argv)
 	return STR_VAL(copy_string(vm, name, (int)strlen(name)));
 }
 
+/* Error(message) and friends: a table with `type` and `message`, the
+ * shape vm_runtime_error produces for caught-native errors */
+static Value error_make(VM *vm, int argc, Value *argv, const char *type)
+{
+	if (argc != 1 || !IS_STRING(argv[0])) {
+		vm_runtime_error(vm, "%s() takes one string argument.", type);
+		return NIL_VAL;
+	}
+	return fl_error_value(vm, type, AS_CSTRING(argv[0]));
+}
+
+static Value error_ctor(VM *vm, int argc, Value *argv)
+{
+	return error_make(vm, argc, argv, "Error");
+}
+static Value type_error_ctor(VM *vm, int argc, Value *argv)
+{
+	return error_make(vm, argc, argv, "TypeError");
+}
+static Value value_error_ctor(VM *vm, int argc, Value *argv)
+{
+	return error_make(vm, argc, argv, "ValueError");
+}
+static Value io_error_ctor(VM *vm, int argc, Value *argv)
+{
+	return error_make(vm, argc, argv, "IOError");
+}
+static Value network_error_ctor(VM *vm, int argc, Value *argv)
+{
+	return error_make(vm, argc, argv, "NetworkError");
+}
+static Value timeout_error_ctor(VM *vm, int argc, Value *argv)
+{
+	return error_make(vm, argc, argv, "TimeoutError");
+}
+static Value process_error_ctor(VM *vm, int argc, Value *argv)
+{
+	return error_make(vm, argc, argv, "ProcessError");
+}
+static Value module_error_ctor(VM *vm, int argc, Value *argv)
+{
+	return error_make(vm, argc, argv, "ModuleError");
+}
+static Value package_error_ctor(VM *vm, int argc, Value *argv)
+{
+	return error_make(vm, argc, argv, "PackageError");
+}
+
 /*
- * Read a module and run it in the same VM, so its top-level `let` lands in
- * the same globals table and its `export` is just a definition.
+ * import_file(path) -> table of the module's exports
  *
- * This is the only place the runtime reenters the interpreter. Resolved
- * paths are cached, and an in-flight entry catches import cycles.
+ * This is the only place the runtime reenters the interpreter, and it is
+ * where most of 0.6.0's module semantics live.
+ *
+ * What it does, in order:
+ *
+ *   1. resolve the path against the importing file, not the process cwd
+ *   2. look it up in the module cache: loaded, loading, or failed
+ *   3. push a fresh globals table and run the module inside it
+ *   4. copy only the names the module exported into a fresh table
+ *   5. bind that table in the *importing* module under the asked-for name
+ *
+ * Step 3 is the whole of module isolation. `vm->globals` points at the
+ * running module's table, so every OP_DEFINE_GLOBAL inside the module lands
+ * there and nowhere else. Two modules can both define a private `scale` and
+ * they stay separate, which they did not before: a shared table meant the
+ * second one to load silently overwrote the first.
+ *
+ * Step 4 is why `export` finally means something. It used to be a comment:
+ * the declaration was compiled as if the keyword were not there, and the
+ * "exports" were whatever the module had added to the shared table, found by
+ * diffing the table before and after the run. Diffing cannot know which names
+ * were meant to be private -- a module's own helper looked exactly like an
+ * export -- and it cannot survive a module that fails partway. The compiler
+ * emits an explicit export list now, and this reads it.
+ *
+ * Step 5 is where the module becomes visible, and it binds in the importer's
+ * table. A module cannot define a name in its importer, which is what makes
+ * "private" mean private.
+ *
+ * Failure is transactional: on any error the module is marked failed, its
+ * table is discarded, and nothing it defined is bound anywhere. A later
+ * import of the same path reports the failure rather than retrying a
+ * half-initialised module.
  */
 static Value import_file_native(VM *vm, int argc, Value *argv)
 {
-	(void)argc;
+	if (argc != 1) {
+		vm_runtime_error(vm, "import_file() takes one argument.");
+		return NIL_VAL;
+	}
 	if (!IS_STRING(argv[0])) {
 		vm_runtime_error(vm,
-		        "Argument to import_file() must be a file path "
+		        "argument to import_file() must be a file path "
 		        "string.");
 		return NIL_VAL;
 	}
@@ -269,10 +634,8 @@ static Value import_file_native(VM *vm, int argc, Value *argv)
 
 	/*
 	 * Resolve against the importing file's directory, not the process
-	 * working directory. A module path is part of the source, so it
-	 * means the same thing no matter where the user is standing. This
-	 * used to be process-relative and meant a script only worked from
-	 * one directory, which is not a property any language should have.
+	 * working directory. A module path is part of the source, so it means
+	 * the same thing no matter where the user is standing.
 	 *
 	 * An absolute path is left alone by sys_resolve_module().
 	 */
@@ -282,277 +645,277 @@ static Value import_file_native(VM *vm, int argc, Value *argv)
 		return NIL_VAL;
 	}
 
-	/*
-	 * The cache. The key is the resolved path, interned, so two imports
-	 * of the same file spelled the same way are the same key, and two
-	 * files that are actually different are different keys even if one
-	 * is a symlink to the other only in a way flint cannot see. That is
-	 * the correct definition of "the same module": same resolved name.
-	 *
-	 * TRUE means loaded, NIL means in flight. The NIL case is a cycle:
-	 * this file is already being executed further up the stack, so
-	 * running it again would recurse forever.
-	 */
+	/* Rooted across everything below: every step can allocate. */
 	ObjString *key = copy_string(vm, path, (int)strlen(path));
-	vm_push(vm, STR_VAL(key)); /* rooted: every call below can collect */
+	vm_push(vm, STR_VAL(key));
 
+	/*
+	 * The cache holds one of three things, and the value is the state:
+	 *
+	 *   a table   loaded. this is also the module's exports, so a
+	 *             repeated import is a lookup rather than a second run
+	 *   nil       in flight. the same path is already being executed
+	 *             further up the import stack
+	 *   false     failed. re-running would repeat a failure the user
+	 *             has not changed anything about
+	 *
+	 * The loaded case has to be checked first and by type, because a
+	 * module's exports are an ordinary Flint table and could in
+	 * principle be any value -- testing for TRUE instead would report
+	 * every successful module as failed.
+	 */
 	Value cached;
 	if (table_get(&vm->modules, key, &cached)) {
-		vm_pop(vm); /* the key */
-		free(path);
+		if (IS_FLINT_TABLE(cached)) {
+			vm_pop(vm); /* the key */
+			free(path);
+			return cached;
+		}
 		if (IS_NIL(cached)) {
+			/*
+			 * NIL means in flight, which means this file is already
+			 * being executed further up the import stack. Running it
+			 * again would recurse until the frame limit, so the
+			 * cycle is reported here with the path that caused it.
+			 */
 			vm_runtime_error(vm,
-			        "import cycle: '%s' is already being "
-			        "loaded.",
+			        "import cycle: '%s' is already being loaded.",
 			        raw);
+			vm_pop(vm); /* the key */
+			free(path);
 			return NIL_VAL;
 		}
-		return TRUE_VAL; /* already loaded. nothing to do. */
+		/* a previous attempt failed */
+		vm_runtime_error(vm,
+		        "module '%s' failed to load earlier in this run.",
+		        raw);
+		vm_pop(vm); /* the key */
+		free(path);
+		return NIL_VAL;
 	}
 
-	/* mark it in flight before running, so a cycle inside sees this */
+	/* mark in flight before running, so a cycle inside sees this */
 	table_set(vm, &vm->modules, key, NIL_VAL);
 
 	FILE *file = fopen(path, "rb");
 	if (file == NULL) {
 		vm_runtime_error(vm, "could not open module file '%s'.", raw);
-		/* remove the in-flight marker: the file did not load, and
-		 * leaving it marked would make a later attempt look like a
-		 * cycle rather than a missing file. */
-		table_delete(&vm->modules, key);
+		table_set(vm, &vm->modules, key, FALSE_VAL);
 		vm_pop(vm);
 		free(path);
 		return NIL_VAL;
 	}
-	/* from here every path out must free(path) */
-	/*
-	 * ftell returns -1 on failure, and a module path can just as easily
-	 * be a pipe or a directory as a regular file. Test it before
-	 * storing: as a size_t that -1 becomes SIZE_MAX, the +1 below wraps
-	 * to 0, and the fread writes past a zero byte allocation.
-	 */
+
 	if (fseek(file, 0L, SEEK_END) != 0) {
+		vm_runtime_error(vm, "could not seek in '%s'.", raw);
 		fclose(file);
+		table_set(vm, &vm->modules, key, FALSE_VAL);
+		vm_pop(vm);
 		free(path);
-		vm_runtime_error(
-		        vm, "could not seek in module file '%s'.", raw);
 		return NIL_VAL;
 	}
-	long length = ftell(file);
-	if (length < 0) {
+	long size = ftell(file);
+	if (size < 0) {
+		/*
+		 * ftell returns -1 on failure, and a module path can just as
+		 * easily be a directory or a pipe as a regular file.
+		 */
+		vm_runtime_error(vm, "could not size '%s'.", raw);
 		fclose(file);
+		table_set(vm, &vm->modules, key, FALSE_VAL);
+		vm_pop(vm);
 		free(path);
-		vm_runtime_error(vm, "could not size module file '%s'.", raw);
 		return NIL_VAL;
 	}
-	size_t size = (size_t)length;
-	/* rewind() swallows the seek error; fseek() does not */
+	size_t bytes = (size_t)size;
+	if (bytes >= (size_t)-1) {
+		vm_runtime_error(vm, "'%s' is too large.", raw);
+		fclose(file);
+		table_set(vm, &vm->modules, key, FALSE_VAL);
+		vm_pop(vm);
+		free(path);
+		return NIL_VAL;
+	}
 	if (fseek(file, 0L, SEEK_SET) != 0) {
+		vm_runtime_error(vm, "could not rewind '%s'.", raw);
 		fclose(file);
+		table_set(vm, &vm->modules, key, FALSE_VAL);
+		vm_pop(vm);
 		free(path);
-		vm_runtime_error(vm, "could not rewind module file '%s'.", raw);
 		return NIL_VAL;
 	}
 
-	/* malloc, not ALLOCATE: the buffer is handed to vm_interpret, which
-	 * roots what it needs, and it must survive a collection. */
-	char *buffer = (char *)malloc(size + 1);
+	char *buffer = malloc(bytes + 1);
 	if (buffer == NULL) {
+		vm_runtime_error(vm, "out of memory loading '%s'.", raw);
 		fclose(file);
+		table_set(vm, &vm->modules, key, FALSE_VAL);
+		vm_pop(vm);
 		free(path);
-		vm_runtime_error(vm, "out of memory reading module '%s'.", raw);
 		return NIL_VAL;
 	}
-
-	/* a short read means a directory, a pipe, or a race. an unterminated
-	 * buffer would be handed to the compiler as a truncated script */
-	size_t bytes_read = fread(buffer, 1, size, file);
-	if (bytes_read < size) {
+	size_t got = fread(buffer, 1, bytes, file);
+	if (got < bytes) {
+		/* a short read is a directory, a pipe, or a race. handing a
+		 * truncated buffer to the compiler would be worse. */
+		vm_runtime_error(vm, "could not read '%s'.", raw);
 		free(buffer);
 		fclose(file);
+		table_set(vm, &vm->modules, key, FALSE_VAL);
+		vm_pop(vm);
 		free(path);
-		vm_runtime_error(vm, "could not read module file '%s'.", raw);
 		return NIL_VAL;
 	}
 	/*
-	 * The NUL lands in the byte the +1 above was allocated for. size is
-	 * the same value used in the malloc, so this is in bounds by
-	 * construction; the analyser reports a tainted index because size
-	 * came from ftell on a path the script chose, and it does not tie
-	 * the index back to the allocation.
+	 * In bounds: the allocation above is `bytes + 1`. The analyzer cannot
+	 * tie `bytes` back to it across the ftell/fseek sequence, which is the
+	 * same complaint it makes about the identical read_file() in main.c,
+	 * where the same annotation is already in place.
 	 */
 	/* NOLINTNEXTLINE(clang-analyzer-security.ArrayBound) */
-	buffer[size] = '\0';
+	buffer[bytes] = '\0';
 	fclose(file);
 
 	/*
-	 * vm_interpret below can fail and, worse, can import further modules
-	 * that resolve against *their* importing file. the source directory is
-	 * a single VM-wide setting, so a nested import overwrites it and the
-	 * next import in the outer file would resolve against the wrong
-	 * directory. push the current one, run, restore. this is the
-	 * difference between 'lib/math.fl' meaning one thing and meaning
-	 * whatever the last nested import left behind.
+	 * Push a fresh environment. The module's top-level definitions go
+	 * here and nowhere else, and `vm->globals` points at it for the
+	 * duration, so the bytecode needs no change to be isolated.
 	 */
-	/*
-	 * Snapshot the global names so we can tell which ones the module
-	 * added. only needed for a library, and only for a few hundred
-	 * entries, so the scan is linear and the array is short-lived.
-	 */
-	ObjString **before_keys = NULL;
-	Value *before_vals = NULL;
-	int before_count = 0;
-	bool is_library = strchr(raw, '/') == NULL;
-	if (is_library && vm->globals.count > 0) {
-		before_count = vm->globals.count;
-		before_keys =
-		        malloc(sizeof(ObjString *) * (size_t)before_count);
-		before_vals = malloc(sizeof(Value) * (size_t)before_count);
-		/*
-		 * Both frees, not just the one that failed.
-		 *
-		 * malloc returning NULL for the second call and not the first is
-		 * entirely ordinary, and taking the early return while holding
-		 * the successful one is a leak that only shows up under memory
-		 * pressure -- which is exactly when a leak is most expensive and
-		 * least likely to be noticed. This is the shape clang-analyzer
-		 * flags as a leak on both buffers, and it was a real leak.
-		 */
-		if (before_keys == NULL || before_vals == NULL) {
-			free(before_keys);
-			free(before_vals);
-			free(path);
-			vm_pop(vm);
-			vm_runtime_error(vm, "Out of memory in import.");
-			return NIL_VAL;
-		}
-		/*
-		 * count is decremented as entries are written, not fixed up
-		 * afterwards.
-		 *
-		 * The loop below stops early when it runs out of slots with a
-		 * real key, so a fixed before_count would leave the tail of both
-		 * arrays uninitialised -- and the comparison loops further down
-		 * read up to before_count. Sizing the count to what was actually
-		 * written makes the arrays' extent and the loop bound the same
-		 * number, which is the only way they cannot disagree.
-		 */
-		int written = 0;
-		for (int i = 0;
-		        i < vm->globals.capacity && written < before_count;
-		        i++) {
-			if (vm->globals.entries[i].key == NULL)
-				continue;
-			before_keys[written] = vm->globals.entries[i].key;
-			before_vals[written] = vm->globals.entries[i].value;
-			written++;
-		}
-		before_count = written;
-	}
-
-	InterpretResult res = vm_interpret_named(vm, buffer, path);
-	free(buffer);
-	free(path);
-	if (res != INTERPRET_OK) {
-		free(before_keys);
-		free(before_vals);
-		/* a module that failed partway is not "loaded". drop the
-		 * marker so a retry re-runs it rather than looking like
-		 * a cycle. its partial globals stay, which is flint's
-		 * documented behaviour for a failed import. */
-		table_delete(&vm->modules, key);
+	if (vm->globals_count >= FL_MODULE_DEPTH + 1) {
+		vm_runtime_error(vm,
+		        "modules nested more than %d deep. is an import "
+		        "loop that the cycle check missed?",
+		        FL_MODULE_DEPTH);
+		free(buffer);
+		table_set(vm, &vm->modules, key, FALSE_VAL);
 		vm_pop(vm);
+		free(path);
 		return NIL_VAL;
 	}
 
 	/*
-	 * A library import binds what the module defined to a table named
-	 * after the library, so `import math` gives you `math.sqrt` rather
-	 * than a flat `sqrt` that collides with whatever the caller
-	 * already had.
+	 * Save the importer's environment and install a fresh one.
 	 *
-	 * "what the module defined" is found by diffing the globals table
-	 * across the run, which is crude. it is also honest about why: a
-	 * real export list is a compiler change, and this needs no new
-	 * syntax, no new state, and no second module system. `export` stays
-	 * a convention and this is the one place it is enforced.
+	 * Every import gets a new environment, even two imports in a row at
+	 * the same depth. globals_used is the high-water mark of slots ever
+	 * taken and only grows: reusing a slot would hand the second module
+	 * the first module's table, and its `scale` would already be defined
+	 * as a const -- which is how two unrelated modules ended up reporting
+	 * "cannot redefine constant" against each other's names.
 	 */
-	if (is_library) {
-		ObjTable *bag = new_flint_table(vm);
-		vm_push(vm, OBJ_VAL(bag));
-
-		for (int i = 0; i < vm->globals.capacity; i++) {
-			ObjString *gname = vm->globals.entries[i].key;
-			if (gname == NULL)
-				continue;
-			bool redefined = false;
-			for (int k = 0; k < before_count; k++) {
-				if (before_keys[k] == gname &&
-				        !values_equal(before_vals[k],
-				                vm->globals.entries[i].value)) {
-					redefined = true;
-					break;
-				}
-			}
-			bool existed = false;
-			for (int k = 0; k < before_count; k++) {
-				if (before_keys[k] == gname) {
-					existed = true;
-					break;
-				}
-			}
-			if (existed && !redefined)
-				continue;
-			if (bag->count == bag->capacity) {
-				int old = bag->capacity;
-				bag->capacity = old > 0 ? old * 2 : 8;
-				bag->keys = realloc(bag->keys,
-				        sizeof(ObjString *) *
-				                (size_t)bag->capacity);
-				bag->values = realloc(bag->values,
-				        sizeof(Value) * (size_t)bag->capacity);
-				if (bag->keys == NULL || bag->values == NULL) {
-					/*
-					 * Both frees. `before_keys` and `before_vals`
-					 * are snapshots taken before the module ran,
-					 * still live on this path, and the bag is
-					 * rooted on the value stack so the collector
-					 * will find that one.
-					 */
-					free(before_keys);
-					free(before_vals);
-					vm_pop(vm); /* the bag */
-					vm_runtime_error(
-					        vm, "Out of memory in import.");
-					return NIL_VAL;
-				}
-			}
-			vm_push(vm, STR_VAL(gname));
-			bag->keys[bag->count] = gname;
-			bag->values[bag->count] = vm->globals.entries[i].value;
-			bag->count++;
-			vm_pop(vm);
-		}
-
-		/*
-		 * Bind under the name that was *asked for*, not the
-		 * resolved path. `key` is the interned resolved path, so
-		 * using it here would define a global called
-		 * "lib/math.fl" and leave `math` undefined, which is
-		 * exactly the bug this replaced.
-		 */
-		ObjString *libname = copy_string(vm, raw, (int)strlen(raw));
-		vm_push(vm, STR_VAL(libname));
-		table_set(vm, &vm->globals, libname, OBJ_VAL(bag));
-		vm_pop(vm);
-		vm_pop(vm); /* the bag */
+	Table *saved_globals = vm->globals;
+	int want = vm->globals_used + 1;
+	if (want > vm->globals_capacity) {
+		int old_cap = vm->globals_capacity;
+		int fresh = old_cap * 2;
+		if (fresh < want)
+			fresh = want;
+		Table **grown = GROW_ARRAY(vm,
+		        Table *,
+		        vm->globals_envs,
+		        (size_t)old_cap,
+		        (size_t)fresh);
+		for (int i = old_cap; i < fresh; i++)
+			grown[i] = NULL;
+		vm->globals_envs = grown;
+		vm->globals_capacity = fresh;
 	}
-	free(before_keys);
-	free(before_vals);
+	vm->globals_envs[vm->globals_used] = ALLOCATE(vm, Table, 1);
+	table_init(vm->globals_envs[vm->globals_used]);
+	/* Remember the table pointer for this module. We can't read it by
+	 * index at export-table build time because nested imports push their
+	 * own tables on top, shifting globals_used. */
+	Table *module_env = vm->globals_envs[vm->globals_used];
+	vm->globals_used++;
+	vm->globals = vm->globals_envs[vm->globals_used - 1];
+	vm->globals_count++;
 
-	table_set(vm, &vm->modules, key, TRUE_VAL);
+	InterpretResult res = vm_interpret_named(vm, buffer, path);
+
+	/* always restore, on every path out. this is the transaction's
+	 * rollback: the importer's names are untouched by whatever the module
+	 * did, whether it succeeded or failed. */
+	vm->globals_count--;
+	vm->globals = saved_globals;
+
+	if (res != INTERPRET_OK) {
+		/*
+		 * The module failed. Nothing it defined was bound anywhere --
+		 * it was never bound into the importer -- so the transaction
+		 * has already rolled back by the restore above, and the cache
+		 * entry is about to record the failure.
+		 *
+		 * The module's own environment is deliberately NOT freed, and
+		 * the slot is kept.
+		 *
+		 * A failed module can still have handed out closures: it ran far
+		 * enough to build them, and it may have stored one somewhere the
+		 * importer can reach. Those closures carry a pointer to this
+		 * environment, and freeing it turns every later call into a
+		 * use-after-free -- which is precisely the class of bug the
+		 * importer-survives-a-failed-module test exists to catch, and
+		 * which ASan caught here first.
+		 *
+		 * Leaving it to the collector is the right answer for a GC
+		 * runtime anyway: unreachable things get reclaimed, reachable
+		 * things stay alive, and no amount of careful bookkeeping here
+		 * can out-guess who held a reference.
+		 */
+		free(buffer);
+		table_set(vm, &vm->modules, key, FALSE_VAL);
+		vm_pop(vm);
+		free(path);
+		/* surface the module's error in the importing script, so
+		 * try/catch around an import catches module failures */
+		if (vm->has_pending)
+			vm_throw_value(vm, vm->pending_error);
+		return NIL_VAL;
+	}
+
+	/*
+	 * Build the export table from what the module actually exported.
+	 *
+	 * The list comes from the compiler, not from inspecting the
+	 * environment: it emitted an OP_MODULE_EXPORTS naming the names marked
+	 * `export`, so "private" is a decision the module made rather than
+	 * something guessed after the fact.
+	 */
+	ObjTable *bag = new_flint_table(vm);
+	vm_push(vm, OBJ_VAL(bag));
+
+	for (int i = 0; i < module_env->capacity; i++) {
+		ObjString *name = module_env->entries[i].key;
+		if (name == NULL)
+			continue;
+		if (!module_env->entries[i].is_exported)
+			continue;
+		Value value = module_env->entries[i].value;
+		vm_push(vm, STR_VAL(name));
+		/* a Flint-level table, so `import geometry` gives
+		 * `geometry.area(5)` through ordinary field access rather
+		 * than through anything import-specific. */
+		if (bag->count == bag->capacity) {
+			int old = bag->capacity;
+			bag->capacity = old > 0 ? old * 2 : 8;
+			bag->keys = GROW_ARRAY(
+			        vm, ObjString *, bag->keys, old, bag->capacity);
+			bag->values = GROW_ARRAY(
+			        vm, Value, bag->values, old, bag->capacity);
+		}
+		bag->keys[bag->count] = name;
+		bag->values[bag->count] = value;
+		bag->count++;
+		vm_pop(vm);
+	}
+
+	free(buffer);
+
+	/* cache the finished module under its resolved path */
+	table_set(vm, &vm->modules, key, OBJ_VAL(bag));
+	vm_pop(vm); /* the bag */
 	vm_pop(vm); /* the key */
-	return TRUE_VAL;
+	free(path);
+	return OBJ_VAL(bag);
 }
 
 /* called from vm_init(), before any user code runs. */
@@ -606,13 +969,30 @@ static Value slice_native(VM *vm, int argc, Value *argv)
 void register_natives(VM *vm)
 {
 	vm_define_native(vm, "clock", clock_native, 0);
+	vm_define_native(vm, "Error", error_ctor, 1);
+	vm_define_native(vm, "TypeError", type_error_ctor, 1);
+	vm_define_native(vm, "ValueError", value_error_ctor, 1);
+	vm_define_native(vm, "IOError", io_error_ctor, 1);
+	vm_define_native(vm, "NetworkError", network_error_ctor, 1);
+	vm_define_native(vm, "TimeoutError", timeout_error_ctor, 1);
+	vm_define_native(vm, "ProcessError", process_error_ctor, 1);
+	vm_define_native(vm, "ModuleError", module_error_ctor, 1);
+	vm_define_native(vm, "PackageError", package_error_ctor, 1);
+	vm_define_native(
+	        vm, "__range_step_error", range_step_error_native, 0);
 	/* -1 for the arity because input() takes zero or one argument, and
 	 * a fixed-arity native cannot express that. the check is inside. */
 	vm_define_native(vm, "input", input_native, -1);
 	vm_define_native(vm, "len", len_native, 1);
 	vm_define_native(vm, "push", push_native, 2);
 	vm_define_native(vm, "pop", pop_native, 1);
+	vm_define_native(vm, "insert", insert_native, 3);
+	vm_define_native(vm, "remove", remove_native, 2);
+	vm_define_native(vm, "keys", keys_native, 1);
+	vm_define_native(vm, "has", has_native, 2);
+	vm_define_native(vm, "delete", delete_native, 2);
 	vm_define_native(vm, "str", str_native, 1);
+	vm_define_native(vm, "num", num_native, 1);
 	vm_define_native(vm, "type", type_native, 1);
 	vm_define_native(vm, "__slice", slice_native, 3);
 	/* args, env, exit, read_file, write_file, exec. a different kind of

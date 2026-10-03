@@ -1,5 +1,264 @@
 # releases
 
+## v0.7.0
+
+a daily-use release. the language learns to talk to the operating system,
+tables learn to be iterated, two small syntax additions cover the config
+patterns every script rewrites by hand, and the library stops needing a
+rebuild: `flint sync` updates it in place, and `import http` means a script
+can talk to the network.
+
+### os and process
+
+`import os` answers what the machine knows: platform and architecture,
+working directory, environment variables with defaults, home and temporary
+directories, and the process id.
+
+```flint
+import os
+print(os.name() + "/" + os.arch())
+print(os.getenv("HOME", ""))
+```
+
+`import process` runs programs and reads what they said. the command is a
+list, never a string, and there is no shell anywhere in the path. both
+streams are captured, so a child that writes a lot to stderr cannot deadlock
+a parent that reads stdout.
+
+```flint
+import process
+let r = process.run(["git", "status", "--short"])
+print(r.code)
+print(r.stdout)
+```
+
+options are a table with `cwd`, `stdin` and `timeout` keys, all optional.
+unknown keys are an error rather than ignored. a timeout kills with SIGKILL
+and reports `timed_out: true` alongside the wait status, so a timeout kill
+is distinguishable from a signal death.
+
+### tables grow up
+
+`for k, v in t` walks entries in insertion order. `t[k]` reads and writes
+through computed keys. `keys(t)`, `has(t, k)` and `delete(t, k)` ask and
+remove. field access compares by content now, so a key built at run time
+finds the entry a literal created -- pointer comparison would answer nil
+there, which was a latent 0.5.0 inconsistency.
+
+lists gain `insert` and `remove` with the same index rules as subscript.
+
+### two small syntax additions
+
+`a ?? b` is `b` when `a` is nil and `a` otherwise, with the right side
+running only when needed. only nil triggers it: `false`, `0` and `""` stay.
+right-associative, looser than `or`, tighter than `=`.
+
+`let {host, port} = config` binds each name from the table's fields. flat
+names only; missing keys read nil; `const` works the same way.
+
+### `flint sync`
+
+updating the standard library no longer requires a rebuild. `flint sync`
+downloads the library from the project's github and installs it into
+`~/.flint/stdlib`. every file is compiled in the binary before it is
+renamed over the old one, so a truncated transfer or a 404 leaves the old
+files alone; identical files are left alone. `--dry-run` shows the change
+set without writing, and `--ref=v0.7.0` pins to a release tag. a module
+whose imports fail verification is skipped with a suggestion to pin the
+reference and bump flint itself.
+
+### `http`
+
+`import http` is a new client for requests. `http.get`, `http.post`,
+`http.put`, `http.delete`, `http.request`, and `http.get_json` cover the
+orthodox cases. `http://` is handled by a small built-in client -- the
+one new piece of libc facing code this release adds -- and `https://`
+delegates to `curl(1)`, because https is TLS and TLS is not something to
+reimplement in a dependency-free language. results are tables: `ok`,
+`status`, `headers`, `body`, `url`, `redirects`, `error`.
+
+### module exports fix
+
+a module that imported a sibling module could be exported under the
+*sibling's* name set. `import_file` built a module's export table from
+`globals_envs[globals_used - 1]`, but a nested import pushes the nested
+module's env on top, shifting the index. `http.fl`, the first
+shipped module to import a sibling (`json`), surfaced the bug at
+imported-by-two-degrees depth. The module's env is now held by pointer.
+covered by a regression test that checks the export keys of a module
+with a sibling import.
+
+### deliberately not shipped
+
+`defer` was evaluated and deferred. its motivating example needs file
+handles, which do not exist -- only whole-file `read`/`write` -- so there is
+nothing to clean up yet. and the failure policy for a deferred action that
+itself fails needs per-action error isolation the unwind model does not
+have. the design is in ARCHITECTURE.md for when handles land. a cleanup
+construct with nothing to clean up would be scope creep with a good name.
+
+no table `sort`: heterogeneous values have no total order worth promising.
+no native loader, no JIT, per the plan.
+
+### gate
+
+63 tests on release under gcc and clang, on the computed-goto build, and
+under ASan + UBSan + GC-on-every-allocation -- plus new tests for every
+feature above. diagnostics, unit tests, clang-tidy, clang-format,
+trailing-newline check clean. every example runs. `flint sync` is
+exercised against the live repository and a local mirror.
+
+## v0.6.1
+
+`num()`, the install story, and imports that enforce themselves.
+
+### unused imports are an error
+
+An import whose bound name is never read fails compilation:
+
+```
+[line 1] Error at 'math': imported 'math' but never used. remove the import,
+or use it.
+```
+
+An import always runs its file, so an unused one is dead code with a side
+effect. Either use the binding or delete the line. `import "x.fl" as _` opts
+out explicitly, for the one legitimate case: importing a module for its
+failure, where there is nothing to use. The REPL is exempt, since each
+submission compiles separately.
+
+### missing imports suggest themselves
+
+Reading a name that was never defined, where a module file exists with the
+matching shape, names the import instead of guessing at a typo:
+
+```
+= help: did you forget to `import math`?
+```
+
+This replaces the "did you mean" suggestion when it fires -- an exact hit on
+a real file beats a fuzzy match. Covers the standard library and sibling
+files beside the importing one.
+
+### num
+
+`input()` returns a string and there was no way to get a number out of one.
+`as number` is a type assertion, not a conversion, so `"9" as number`
+correctly fails -- and then the user has a string that looks like a number
+and no function that agrees.
+
+```flint
+import math
+
+const a = num(input("a: "))
+print(math.sqrt(a))
+```
+
+`num("42")` is 42. `num("  7  ")` is 7, because what `input()` hands back
+includes whatever whitespace the user typed. `num("12abc")` fails rather
+than returning 12; returning a prefix would be guessing. Numbers pass
+through, so it is safe to call on something that might already be one.
+
+A failed conversion is an error naming the value, not nil. Nil would surface
+three calls later as an operand error in code that had nothing to do with it.
+
+### make install
+
+`make install` puts the binary in `~/.local/bin` and the library in
+`~/.flint/stdlib`, which is the third entry in the lookup order the runtime
+already documents. `PREFIX`, `BINDIR`, `LIBDIR` and `DESTDIR` override all of
+that for packaging. `README.md` installation instructions match what the
+Makefile does, which they previously did not -- they described building in
+place and stopped there.
+
+## v0.6.0
+
+a module-system release. `import` binds one name to a module's exports,
+`export` decides what those are, and the REPL takes a block.
+
+### the bug this fixes
+
+Two modules could not both have a private helper of the same name. Both wrote
+into one shared global table, so:
+
+```flint
+# geometry.fl          # display.fl
+let scale = 2          let scale = 10
+export fn area(r) {    export fn show(v) {
+  return 3*r*r*scale     return v * scale
+}                     }
+```
+
+```flint
+import "geometry.fl"
+import "display.fl"
+print(geometry.area(2))
+```
+
+printed **120**. `scale` resolved to 10, because `display.fl` loaded second.
+No error and no warning -- a wrong number, which is the worst failure a
+language can have. It is now 24, because each module has its own environment.
+
+### what changed
+
+**every module has its own globals.** `vm->globals` became a pointer into a
+heap array of per-module tables, and the bytecode did not change at all --
+`OP_DEFINE_GLOBAL` means "whatever table this module is running in". A closure
+remembers the environment it was created in, so a function called long after
+its module loaded still sees that module's private names.
+
+**`export` means something.** Four opcodes flag a binding exported at compile
+time. Previously `export` was a comment and the exports were found by diffing
+the global table across the module's run, which cannot distinguish a helper
+from a public function -- both are a name that appeared.
+
+**failed imports are transactional.** A module that fails binds nothing
+anywhere. Its partial globals used to survive, and a second import retried
+against them. Its environment is deliberately not freed, though: it may have
+handed out a closure the importer holds, and freeing it turns every later call
+into a use-after-free.
+
+**`import "x.fl" as name`.** The default binding is the last path component
+without the extension, which is what existing scripts already spelled.
+
+**the REPL takes a block.** Delimiter depth with strings and comments skipped,
+because a brace inside a string literal is not an open block.
+
+**a bug found and fixed.** `OP_LIST_LEN`, added in 0.5.0 to remove a native
+call from every for-in iteration, only understood lists. `len` takes strings
+too, so `for c in s` over a string stopped working. Nothing in the test suite
+noticed, because every for-in loop in the tree iterates a list. It surfaced
+when every example was run as part of this release. There is a regression test
+now.
+
+### breaking change
+
+an import no longer dumps names into the importer.
+
+```flint
+# before                      # after
+import "helper.fl"            import "helper.fl"
+print(square(6))              print(helper.square(6))
+print(LIMIT)                  print(helper.LIMIT)
+```
+
+`docs/modules.md` has the full model and a migration section.
+
+### not in this release
+
+**no native extension ABI.** Sections 15-23 of the 0.6.0 plan were left out.
+A versioned public header, dlopen/dylib loading, and ownership rules are a
+real piece of work, and a half-specified one is worse than none: an extension
+with a subtly wrong ownership rule corrupts memory rather than failing. It
+should be its own release with its own differential tests.
+
+**no JIT**, per the plan.
+
+**no table `has`/`delete`/`keys` or list `insert`/`remove`.** The collections
+work and are tested; the additions were not reached. The spec says defer rather
+than compromise, and these are additive rather than correctness fixes, so
+deferring them costs nothing today.
+
 ## v0.5.0
 
 a runtime release. the language does not change at all -- not one keyword, not

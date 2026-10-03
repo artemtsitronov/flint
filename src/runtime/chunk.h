@@ -118,6 +118,27 @@ typedef enum {
 	 * Operands: none. Stack: [list] -> [number].
 	 */
 	OP_LIST_LEN,
+	/*
+	 * The three table-iteration primitives, emitted only by `for k in t`
+	 * and `for k, v in t`.
+	 *
+	 * A table is insertion-ordered parallel arrays, so position `i` always
+	 * means the i-th inserted entry. The loop holds an index in a hidden
+	 * local and reads through these, exactly as list iteration holds an
+	 * index and reads through OP_GET_INDEX -- same shape, same reasoning.
+	 *
+	 * All three take no operands:
+	 *   OP_TABLE_COUNT  [table] -> [number]
+	 *   OP_TABLE_KEY    [table][index] -> [key-string]
+	 *   OP_TABLE_VALUE  [table][index] -> [value]
+	 *
+	 * Bounds are checked with the same whole-number validation as list
+	 * indexing, so a fractional or out-of-range index fails the same way
+	 * in both.
+	 */
+	OP_TABLE_COUNT,
+	OP_TABLE_KEY,
+	OP_TABLE_VALUE,
 	OP_BUILD_LIST,
 	OP_BUILD_TABLE,
 	/*
@@ -173,6 +194,47 @@ typedef enum {
 	OP_EQ_NUM,
 	OP_NEQ_NUM,
 	OP_NEG_NUM,
+	/*
+	 * The `export` forms of the two global definitions.
+	 *
+	 * Identical to their unmarked counterparts except that the binding is
+	 * flagged exported, which the module loader reads when it builds the
+	 * table the importer receives.
+	 *
+	 * Separate opcodes rather than a flag in an operand byte because the
+	 * operand is a constant index and stealing its high bit would mean
+	 * every global access in every program carries a flag it does not use.
+	 * The ordinary `let` stays two bytes.
+	 */
+	OP_DEFINE_GLOBAL_EXPORT,
+	OP_DEFINE_GLOBAL_EXPORT_LONG,
+	OP_DEFINE_GLOBAL_CONST_EXPORT,
+	OP_DEFINE_GLOBAL_CONST_EXPORT_LONG,
+	/*
+	 * Jump when the top of stack is not nil, peeking rather than popping.
+	 *
+	 * Emitted only by `??`, which needs "keep the value and skip the
+	 * fallback" in one jump: if the left side is not nil it stays and the
+	 * right side never runs; if it is nil the jump falls through to a POP
+	 * and the right side takes its place. Either path leaves one value.
+	 */
+	OP_JUMP_IF_NOT_NIL,
+	/*
+	 * Recoverable errors. See vm.h for the handler model.
+	 *
+	 * OP_TRY, u16: push a catch handler on the VM's handler stack and
+	 * continue. The offset is the jump past the try body to the catch
+	 * block, measured from the end of the instruction -- the same
+	 * encoding as OP_JUMP, so the compiler's emit_jump()/patch_jump()
+	 * emit it, and the verifier's jump-target check covers it.
+	 *
+	 * OP_POP_HANDLER: the try body finished normally; drop the handler.
+	 *
+	 * OP_THROW: pop the value above and raise it.
+	 */
+	OP_TRY,
+	OP_POP_HANDLER,
+	OP_THROW,
 } OpCode;
 
 typedef struct {
